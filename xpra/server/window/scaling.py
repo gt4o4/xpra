@@ -6,7 +6,7 @@
 """Video scaling decisions over explicit settings and a snapshot of window state."""
 
 from dataclasses import dataclass
-from math import sqrt
+from math import sqrt, gcd
 
 Scaling = tuple[int, int | float]
 DEFAULT_SCALING_OPTIONS = (1, 10), (1, 5), (1, 4), (1, 3), (1, 2), (2, 3), (1, 1)
@@ -30,6 +30,7 @@ class ScalingState:
     height: int
     max_width: int = 4096
     max_height: int = 4096
+    max_pixels: int = 0
     client_render_size: tuple[int, int] = (0, 0)
     control: int | None = None
     requested_scaling: Scaling | None = None
@@ -48,6 +49,49 @@ class ScalingState:
     maximized: bool = False
 
 
+def fits_pixel_budget(width: int, height: int, max_pixels: int) -> bool:
+    # measured on 32-aligned dimensions: hardware decoder area limits
+    # are macroblock counts of the CODED size (ie: VDPAU feature-set-A
+    # caps H264 at 8192 16x16 macroblocks = 2097152 pixels), and
+    # encoders pad the coded size - nvenc to 32-aligned dimensions
+    # (verified: a 1884x1104 scale target was coded as 1888x1120 =
+    # 8260 macroblocks, busting an 8192 budget the unpadded size met).
+    # 32 covers the worst common alignment; 16-aligning encoders just
+    # get a slightly conservative fit.
+    if max_pixels <= 0:
+        return True
+    aligned_w = (width + 31) & ~31
+    aligned_h = (height + 31) & ~31
+    return aligned_w * aligned_h <= max_pixels
+
+
+def best_fit_scaling(width: int, height: int, mw: int, mh: int, max_pixels: int) -> tuple[int, int] | None:
+    # the largest exact scaling fraction that satisfies the size and
+    # (32-aligned) pixel-budget constraints - computed directly rather
+    # than quantized to the scaling options, so an oversized window keeps
+    # the maximum resolution the limits allow.  Uses den=width so the
+    # scaled width IS the numerator (integer-exact); the fit predicate
+    # is monotone in num, so binary search applies.
+    def fits(num: int) -> bool:
+        sw = num
+        sh = height * num // width
+        return sw <= mw and sh <= mh and sw >= 1 and sh >= 1 \
+            and fits_pixel_budget(sw, sh, max_pixels)
+    if fits(width):
+        return 1, 1
+    lo, hi = 0, width      # lo: always fits (0=sentinel), hi: does not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    if lo == 0:
+        return None
+    g = gcd(lo, width)
+    return lo // g, width // g
+
+
 def get_min_required_scaling(state: ScalingState, settings: ScalingSettings, default: Scaling = (1, 1)) -> Scaling:
     mw, mh = state.max_width, state.max_height
     if settings.downscale and state.client_render_size != (0, 0):
@@ -55,16 +99,14 @@ def get_min_required_scaling(state: ScalingState, settings: ScalingSettings, def
         crsw, crsh = state.client_render_size
         mw = min(mw, crsw)
         mh = min(mh, crsh)
-    if state.width <= mw and state.height <= mh:
+    if state.width <= mw and state.height <= mh and fits_pixel_budget(state.width, state.height, state.max_pixels):
         return default
-    # Preserve option ordering for equivalent ratios, and choose the largest fit.
-    options = {num/den: (num, den) for num, den in settings.options}
-    for ratio in reversed(sorted(options)):
-        num, den = options[ratio]
-        if num == 1 and den == 1:
-            continue
-        if state.width*num/den <= mw and state.height*num/den <= mh:
-            return num, den
+    # most encoders can't deal with that!
+    # compute the largest exact fraction that fits (not quantized to the
+    # scaling options - keep the maximum resolution the limits allow):
+    best = best_fit_scaling(state.width, state.height, mw, mh, state.max_pixels)
+    if best:
+        return best
     raise ValueError(f"BUG: failed to find a scaling value for window size {state.width}x{state.height}")
 
 
