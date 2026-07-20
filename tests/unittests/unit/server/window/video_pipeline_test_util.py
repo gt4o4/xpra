@@ -40,6 +40,7 @@ def make_source(encoders=None, converters=None):
     source.content_types = ()
     source.is_shadow = False
     source.video_max_size = (4096, 4096)
+    source.video_max_pixels = 0
     source.video_subregion = None
     source.full_csc_modes = typedict({"h264": ("YUV420P", "YUV444P", "RGB")})
     source.encoding_options = typedict()
