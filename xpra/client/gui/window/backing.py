@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterable, Sequence
 from xpra.net import compression
 from xpra.os_util import gi_import
 from xpra.util.objects import typedict
-from xpra.util.parsing import get_default_video_max_size
+from xpra.util.parsing import get_default_video_max_size, get_default_video_max_pixels
 from xpra.util.str_fn import csv
 from xpra.util.env import envint, envbool, first_time
 from xpra.util.thread import check_main_thread
@@ -41,6 +41,7 @@ ALERT_ICON = os.environ.get("XPRA_ALERT_ICON", "alert")
 # prefer csc scaling to cairo's own scaling:
 PREFER_CSC_SCALING = envbool("XPRA_PREFER_CSC_SCALING", True)
 VIDEO_MAX_SIZE = get_default_video_max_size()
+VIDEO_MAX_PIXELS = get_default_video_max_pixels()
 
 PaintCallback: TypeAlias = Callable[[int | bool, str], None]
 PaintCallbacks: TypeAlias = MutableSequence[PaintCallback]

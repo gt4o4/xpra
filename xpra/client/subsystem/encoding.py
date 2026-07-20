@@ -14,7 +14,7 @@ from xpra.codecs.loader import load_codec, codec_versions, has_codec, get_codec,
 from xpra.codecs.video import getVideoHelper
 from xpra.util.parsing import parse_bool_or_int
 from xpra.common import noop
-from xpra.client.gui.window.backing import VIDEO_MAX_SIZE
+from xpra.client.gui.window.backing import VIDEO_MAX_SIZE, VIDEO_MAX_PIXELS
 from xpra.net.common import Packet, FULL_INFO, BACKWARDS_COMPATIBLE
 from xpra.net import compression
 from xpra.util.objects import typedict
@@ -91,7 +91,7 @@ class Encodings(StubClientSubsystem):
         "_codecs_loaded", "_codecs_lock", "allowed_encodings", "csc_modules", "encoding", "encoding_defaults",
         "min_quality", "min_speed", "quality", "server_core_encodings", "server_encodings",
         "server_encodings_with_lossless_mode", "server_encodings_with_quality", "server_encodings_with_speed",
-        "speed", "video_decoders", "video_max_size", "video_scaling",
+        "speed", "video_decoders", "video_max_pixels", "video_max_size", "video_scaling",
     )
     PREFIX = "encoding"
 
@@ -111,6 +111,7 @@ class Encodings(StubClientSubsystem):
         self.min_speed = -1
         self.video_scaling = None
         self.video_max_size = VIDEO_MAX_SIZE
+        self.video_max_pixels = VIDEO_MAX_PIXELS
         self.csc_modules: Sequence[str] = ()
         self.video_decoders: Sequence[str] = ()
 
@@ -322,6 +323,7 @@ class Encodings(StubClientSubsystem):
             "window-icon": self.get_window_icon_encodings(),
             "video_b_frames": video_b_frames,
             "video_max_size": self.video_max_size,
+            "video_max_pixels": self.video_max_pixels,
             "max-soft-expired": MAX_SOFT_EXPIRED,
             "send-timestamps": SEND_TIMESTAMPS,
             "eos": True,

@@ -6,7 +6,7 @@
 import os
 import time
 import operator
-from math import sqrt, ceil
+from math import sqrt, ceil, gcd
 from functools import reduce
 from time import monotonic
 from typing import Any
@@ -78,6 +78,49 @@ SCALING_MIN_PPS = envint("XPRA_SCALING_MIN_PPS", 25*320*240)
 DEFAULT_SCALING_OPTIONS = (1, 10), (1, 5), (1, 4), (1, 3), (1, 2), (2, 3), (1, 1)
 
 ALWAYS_FREEZE = envbool("XPRA_IMAGE_ALWAYS_FREEZE", False)
+
+
+def fits_pixel_budget(width: int, height: int, max_pixels: int) -> bool:
+    # measured on 32-aligned dimensions: hardware decoder area limits
+    # are macroblock counts of the CODED size (ie: VDPAU feature-set-A
+    # caps H264 at 8192 16x16 macroblocks = 2097152 pixels), and
+    # encoders pad the coded size - nvenc to 32-aligned dimensions
+    # (verified: a 1884x1104 scale target was coded as 1888x1120 =
+    # 8260 macroblocks, busting an 8192 budget the unpadded size met).
+    # 32 covers the worst common alignment; 16-aligning encoders just
+    # get a slightly conservative fit.
+    if max_pixels <= 0:
+        return True
+    aligned_w = (width + 31) & ~31
+    aligned_h = (height + 31) & ~31
+    return aligned_w * aligned_h <= max_pixels
+
+
+def best_fit_scaling(width: int, height: int, mw: int, mh: int, max_pixels: int) -> tuple[int, int] | None:
+    # the largest exact scaling fraction that satisfies the size and
+    # (16-aligned) pixel-budget constraints - computed directly rather
+    # than quantized to SCALING_OPTIONS, so an oversized window keeps
+    # the maximum resolution the limits allow.  Uses den=width so the
+    # scaled width IS the numerator (integer-exact); the fit predicate
+    # is monotone in num, so binary search applies.
+    def fits(num: int) -> bool:
+        sw = num
+        sh = height * num // width
+        return sw <= mw and sh <= mh and sw >= 1 and sh >= 1 \
+            and fits_pixel_budget(sw, sh, max_pixels)
+    if fits(width):
+        return 1, 1
+    lo, hi = 0, width      # lo: always fits (0=sentinel), hi: does not
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    if lo == 0:
+        return None
+    g = gcd(lo, width)
+    return lo // g, width // g
 
 
 def parse_scaling_options_str(scaling_options_str: str) -> tuple:
@@ -190,6 +233,7 @@ class WindowVideoSource(WindowSource):
         self.scroll_preference: int = self.encoding_options.intget("scrolling.preference", 100)
         self.supports_video_b_frames: Sequence[str] = self.encoding_options.strtupleget("video_b_frames", ())
         self.video_max_size = self.encoding_options.inttupleget("video_max_size", (8192, 8192), 2, 2)
+        self.video_max_pixels = self.encoding_options.intget("video_max_pixels", 0)
         self.video_stream_file = None
 
     def __repr__(self) -> str:
@@ -310,6 +354,7 @@ class WindowVideoSource(WindowSource):
             info["video_subregion"] = sri
         info["scaling"] = self.actual_scaling
         info["video-max-size"] = self.video_max_size
+        info["video-max-pixels"] = self.video_max_pixels
 
         def addcinfo(prefix, x) -> None:
             if not x:
@@ -485,8 +530,16 @@ class WindowVideoSource(WindowSource):
             self.scaling_control = max(0, min(100, properties.intget("scaling.control", 0)))
         super().do_set_client_properties(properties)
         # encodings may have changed, so redo this:
-        nv_common = set(self.picture_encodings) & set(self.core_encodings)
-        log("common non-video (%s & %s)=%s", self.picture_encodings, self.core_encodings, nv_common)
+        # gate on the registered encoders like do_init_encoders() does:
+        # picture_encodings collects everything a loaded codec CAN emit
+        # (unconditionally), while self._encoders only holds encodings
+        # allowed by the server's core-encodings selection - without the
+        # gate, a banned-but-loadable encoding (ie: webp with pillow
+        # loaded) becomes selectable by get_best_nonvideo_encoding and
+        # make_data_packet then raises "BUG: no encoder found"
+        nv_common = set(self.picture_encodings) & set(self.core_encodings) & set(self._encoders.keys())
+        log("common non-video (%s & %s & %s)=%s", self.picture_encodings, self.core_encodings,
+            tuple(self._encoders.keys()), nv_common)
         self.non_video_encodings = preforder(nv_common)
         if not VIDEO_SKIP_EDGE:
             try:
@@ -1374,8 +1427,10 @@ class WindowVideoSource(WindowSource):
         text_hint = "text" in self.content_types
         if text_hint:
             vmw = vmh = 16384
+            vmp = 0
         else:
             vmw, vmh = self.video_max_size
+            vmp = self.video_max_pixels
         # tune quality target for (non-)video region:
         vr = self.matches_video_subregion(width, height)
         if vr and target_q < 100 and not text_hint:
@@ -1442,10 +1497,18 @@ class WindowVideoSource(WindowSource):
                     max_w = min(encoder_spec.max_w, vmw)
                     max_h = min(encoder_spec.max_h, vmh)
                     if (csc_spec and csc_spec.can_scale) or encoder_spec.can_scale:
-                        if cached_scaling[0] >= width and cached_scaling[1] >= height:
+                        # the cached value was computed with generic 4096x4096
+                        # limits and no pixel budget: it is only valid if the
+                        # window also fits within this encoder's actual limits
+                        # (which include the client's `video_max_size` and
+                        # `video_max_pixels`), otherwise the mandatory
+                        # scale-to-fit of calculate_scaling() would be skipped:
+                        if width <= max_w and height <= max_h \
+                                and fits_pixel_budget(width, height, vmp) \
+                                and cached_scaling[0] >= width and cached_scaling[1] >= height:
                             scaling = cached_scaling[2]
                         else:
-                            scaling = self.calculate_scaling(width, height, max_w, max_h)
+                            scaling = self.calculate_scaling(width, height, max_w, max_h, vmp)
                     else:
                         scaling = (1, 1)
                     score_delta = encoding_score_delta
@@ -1517,7 +1580,8 @@ class WindowVideoSource(WindowSource):
                 return int(pixels/(width*height)/(now - otime))
         return 0
 
-    def calculate_scaling(self, width: int, height: int, max_w: int = 4096, max_h: int = 4096) -> tuple[int, int]:
+    def calculate_scaling(self, width: int, height: int, max_w: int = 4096, max_h: int = 4096,
+                          max_pixels: int = 0) -> tuple[int, int]:
         if width == 0 or height == 0:
             return 1, 1
         now = monotonic()
@@ -1536,19 +1600,14 @@ class WindowVideoSource(WindowSource):
                     mw = crsw
                 if crsh < max_h:
                     mh = crsh
-            if width <= mw and height <= mh:
+            if width <= mw and height <= mh and fits_pixel_budget(width, height, max_pixels):
                 return default_value    # no problem
             # most encoders can't deal with that!
-            # sort them from the smallest scaling value to the highest:
-            sopts = {}
-            for num, den in SCALING_OPTIONS:
-                sopts[num/den] = num, den
-            for ratio in reversed(sorted(sopts.keys())):
-                num, den = sopts[ratio]
-                if num == 1 and den == 1:
-                    continue
-                if width*num/den <= mw and height*num/den <= mh:
-                    return num, den
+            # compute the largest exact fraction that fits (not
+            # quantized to SCALING_OPTIONS - keep maximum resolution):
+            best = best_fit_scaling(width, height, mw, mh, max_pixels)
+            if best:
+                return best
             raise ValueError(f"BUG: failed to find a scaling value for window size {width}x{height}")
 
         def mrs(v=(1, 1), info="using minimum required scaling") -> tuple[int, int]:

@@ -508,11 +508,22 @@ def adjust_monitor_refresh_rate(refresh_rate: str, mdef: dict[int, dict]) -> dic
     return adjusted
 
 
+def get_default_video_max_pixels() -> int:
+    # maximum coded video area, measured on 16-aligned dimensions
+    # (macroblock granularity - hardware decoder area limits, ie:
+    # VDPAU feature-set-A caps H264 at 8192 macroblocks = 2097152);
+    # 0 = no limit
+    try:
+        return int(os.environ.get("XPRA_VIDEO_MAX_PIXELS", "0"))
+    except (TypeError, ValueError):
+        return 0
+
+
 def get_default_video_max_size() -> tuple[int, int]:
     svalues = os.environ.get("XPRA_VIDEO_MAX_SIZE", "").replace("x", ",").split(",")
     if len(svalues) == 2:
         try:
-            return int(svalues[0]), int(svalues[0])
+            return int(svalues[0]), int(svalues[1])
         except (TypeError, ValueError):
             pass
     return 4096, 4096
