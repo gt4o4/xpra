@@ -8,7 +8,8 @@ import unittest
 from dataclasses import replace
 
 from xpra.server.window.scaling import (
-    ScalingSettings, ScalingState, calculate_scaling, get_min_required_scaling, get_scaling_override,
+    ScalingSettings, ScalingState, calculate_scaling, fits_pixel_budget, get_min_required_scaling,
+    get_scaling_override,
 )
 
 
@@ -21,7 +22,8 @@ class ScalingPolicyTest(unittest.TestCase):
             (4096, 4096, 4096, 4096, (1, 1)),
             (6144, 2160, 4096, 4096, (2, 3)),
             (8192, 4096, 4096, 4096, (1, 2)),
-            (1000, 4000, 4096, 2048, (1, 2)),
+            # the largest exact fraction that fits, not the largest option:
+            (1000, 4000, 4096, 2048, (64, 125)),
             (16384, 8192, 4096, 4096, (1, 4)),
         ):
             with self.subTest(size=(width, height), maximum=(max_width, max_height)):
@@ -34,7 +36,24 @@ class ScalingPolicyTest(unittest.TestCase):
         self.assertEqual(get_min_required_scaling(state, replace(self.settings, downscale=False)), (1, 1))
         # A larger client render area must not relax the codec's own limits.
         state = replace(state, max_width=1024, client_render_size=(3840, 2160))
-        self.assertEqual(get_min_required_scaling(state, self.settings), (1, 2))
+        self.assertEqual(get_min_required_scaling(state, self.settings), (8, 15))
+
+    def test_minimum_required_by_pixel_budget(self):
+        # VDPAU feature set A: 8192 macroblocks of 16x16 (2097152 coded pixels)
+        # within 2048x2048 - an area limit a WxH box cannot express:
+        state = replace(self.state, max_width=2048, max_height=2048, max_pixels=2097152)
+        for width, height, expected in (
+            (1920, 1126, (29, 30)),     # 1856x1088: 7888 macroblocks
+            (1920, 1090, (959, 960)),   # 1918x1088
+            (1400, 1300, (1, 1)),       # 1408x1312 coded: fits as it is
+        ):
+            with self.subTest(size=(width, height)):
+                self.assertEqual(get_min_required_scaling(replace(state, width=width, height=height), self.settings),
+                                 expected)
+        # the budget is measured on 32-aligned (coded) dimensions:
+        self.assertTrue(fits_pixel_budget(1884, 1104, 8260*256))
+        self.assertFalse(fits_pixel_budget(1884, 1104, 8192*256))
+        self.assertTrue(fits_pixel_budget(8192, 8192, 0))
 
     def test_minimum_retains_default_when_size_fits(self):
         self.assertEqual(get_min_required_scaling(self.state, self.settings, (1, 3)), (1, 3))
@@ -42,14 +61,19 @@ class ScalingPolicyTest(unittest.TestCase):
         # When the size does not fit, existing behavior selects the largest fit.
         self.assertEqual(get_min_required_scaling(state, self.settings, (1, 3)), (1, 2))
 
-    def test_option_order_and_equivalent_ratios(self):
+    def test_minimum_required_ignores_option_quantization(self):
+        # the mandatory fit keeps the maximum resolution the limits allow,
+        # whatever the options (they only steer the automatic choices):
         state = replace(self.state, max_width=1024)
         settings = replace(self.settings, options=((1, 2), (1, 1), (1, 4), (2, 4)))
-        self.assertEqual(get_min_required_scaling(state, settings), (2, 4))
+        self.assertEqual(get_min_required_scaling(state, settings), (8, 15))
+        self.assertEqual(get_min_required_scaling(state, replace(settings, options=())), (8, 15))
 
     def test_no_ratio_fits(self):
         state = replace(self.state, width=100000)
-        with self.assertRaisesRegex(ValueError, "failed to find a scaling value for window size 100000x1080"):
+        self.assertEqual(get_min_required_scaling(state, self.settings), (128, 3125))
+        state = replace(self.state, width=100000, height=1)
+        with self.assertRaisesRegex(ValueError, "failed to find a scaling value for window size 100000x1"):
             get_min_required_scaling(state, self.settings)
 
     def test_zero_dimensions_and_disabled_scaling(self):
@@ -105,7 +129,7 @@ class ScalingPolicyTest(unittest.TestCase):
             ({"speed": 100}, 60, (1, 5)),
             ({"speed": 0}, 60, (1, 1)),
             ({}, 0, (1, 1)),
-            ({"quality": 100, "max_width": 1024}, 60, (1, 2)),
+            ({"quality": 100, "max_width": 1024}, 60, (8, 15)),
         ):
             with self.subTest(changes=changes, fps=fps):
                 self.assertEqual(calculate_scaling(replace(self.state, **changes), self.settings, fps=fps), expected)
@@ -130,7 +154,10 @@ class ScalingPolicyTest(unittest.TestCase):
                                                    matches_subregion=matches, subregion_is_video=video), expected)
 
     def test_client_scaling_and_thresholds(self):
-        for render_size, expected in (((960, 540), (1, 4)), ((1280, 720), (1, 3)), ((1280, 500), (1, 4.32))):
+        # 1280x500: the exact minimum fit is 890x500 (89/192), so the whole
+        # multiple of the client's downscaling, 1/2.16 = 889x500, is no longer
+        # penalised as it was when the options quantized the minimum to 1/3:
+        for render_size, expected in (((960, 540), (1, 4)), ((1280, 720), (1, 3)), ((1280, 500), (1, 2.16))):
             with self.subTest(render_size=render_size):
                 state = replace(self.state, client_render_size=render_size)
                 result = calculate_scaling(state, self.settings, fps=60)

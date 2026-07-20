@@ -135,7 +135,9 @@ class TestCalculateScaling(unittest.TestCase):
         # Explicit video content short-circuits the subregion classification.
         source.subregion_is_video.assert_not_called()
         source._current_quality = 100
-        self.assertEqual(source.calculate_scaling(3000, 2000, 2048, 2048), (2, 3))
+        self.assertEqual(source.calculate_scaling(3000, 2000, 2048, 2048), (256, 375))
+        # an area limit: 2048x1366 would fit the box but not the budget
+        self.assertEqual(source.calculate_scaling(3000, 2000, 2048, 2048, 2097152), (296, 375))
 
     def test_wrapper_uses_subregion_classification(self):
         source = self.make_source(content_types=())
