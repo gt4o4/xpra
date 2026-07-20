@@ -13,6 +13,7 @@ from typing import Any, NamedTuple, Protocol
 from xpra.codecs.constants import CSCSpec, VideoSpec
 from xpra.codecs.protocols import ColorspaceConverter, VideoEncoder
 from xpra.server.window.video_scoring import LOSSY_CSC, PipelineScore, get_pipeline_score
+from xpra.server.window.scaling import fits_pixel_budget
 from xpra.log import Logger
 
 log = Logger("score")
@@ -38,6 +39,8 @@ class PipelineSettings:
     force_csc: bool
     force_csc_mode: str
     preferred_encodings: Sequence[str]
+    # the client's decoder area limit (`video_max_pixels`), 0 for none:
+    max_pixels: int = 0
 
 
 class PipelineCodecState(NamedTuple):
@@ -59,7 +62,7 @@ def get_pipeline_quality(quality: int, min_quality: int, video_fps: int | None) 
 def get_pipeline_options(encodings: Iterable[str], width: int, height: int, src_format: str,
                          settings: PipelineSettings, specs: PipelineSpecs,
                          get_client_formats: Callable[[str], Sequence[str]], score_deltas: Mapping[str, Any],
-                         calculate_scaling: Callable[[int, int, int, int], tuple[int, int]],
+                         calculate_scaling: Callable[..., tuple[int, int]],
                          is_cancelled: Callable[[], bool], get_codec_state: Callable[[], PipelineCodecState],
                          fps: int) -> tuple[PipelineScore, ...]:
     """Return candidates in stable descending score order, including partial results on cancellation.
@@ -68,6 +71,7 @@ def get_pipeline_options(encodings: Iterable[str], width: int, height: int, src_
     and must check cancellation again before publishing these results.
     """
     max_width, max_height = (16384, 16384) if settings.text_hint else settings.max_size
+    max_pixels = 0 if settings.text_hint else settings.max_pixels
     cached_w = cached_h = 4096
     cached_scaling = calculate_scaling(width, height, cached_w, cached_h)
     scores = []
@@ -109,8 +113,17 @@ def get_pipeline_options(encodings: Iterable[str], width: int, height: int, src_
                 max_w = min(encoder_spec.max_w, max_width)
                 max_h = min(encoder_spec.max_h, max_height)
                 if (csc_spec and csc_spec.can_scale) or encoder_spec.can_scale:
-                    if width <= max_w and height <= max_h and cached_w >= width and cached_h >= height:
+                    # the cached value was computed with generic 4096x4096 limits and no
+                    # pixel budget: it is only valid if the window also fits this encoder's
+                    # limits and the client's `video_max_pixels`, otherwise the mandatory
+                    # scale-to-fit of calculate_scaling() would be skipped:
+                    if (
+                        width <= max_w and height <= max_h and fits_pixel_budget(width, height, max_pixels)
+                        and cached_w >= width and cached_h >= height
+                    ):
                         scaling = cached_scaling
+                    elif max_pixels:
+                        scaling = calculate_scaling(width, height, max_w, max_h, max_pixels)
                     else:
                         scaling = calculate_scaling(width, height, max_w, max_h)
                 else:
