@@ -172,10 +172,13 @@ class OpenGLClient(StubClientSubsystem):
                 log.info(f" using {module} {backend} backend")
                 log.info(" zerocopy is %s", ["not available", "available"][self.properties.get("zerocopy", 0)])
                 # don't try to handle video dimensions bigger than this
-                # (`video_max_size` is owned by the `encoding` subsystem):
+                # (`video_max_size` is owned by the `encoding` subsystem);
+                # only ever lower the value: it may already be capped
+                # tighter, ie: to a hardware decoder's size limits
                 mvs = min(8192, self.texture_size_limit)
                 if enc := self.get_subsystem("encoding"):
-                    enc.video_max_size = (mvs, mvs)
+                    cmw, cmh = enc.video_max_size
+                    enc.video_max_size = (min(mvs, cmw), min(mvs, cmh))
             elif self.client_supports:
                 log(f"OpenGL supported on {driver_info!r}, but not enabled")
             self.properties["enabled"] = self.enabled
