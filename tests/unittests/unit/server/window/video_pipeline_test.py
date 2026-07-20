@@ -283,6 +283,20 @@ class VideoPipelineTest(unittest.TestCase):
         self.assertEqual(self.cancelled.call_count, 2)
         self.codec_state.assert_called_once_with()
 
+    def test_pixel_budget_bypasses_generic_scaling_cache(self):
+        # VDPAU feature-set-A: 8192 macroblocks, measured on 32-aligned dimensions
+        budget = 8192 * 16 * 16
+        self.encoders = {"h264": {"RGB": (encoder_spec(can_scale=True),)}}
+        settings = replace(self.settings, max_pixels=budget)
+        self.select(settings, width=1920, height=1126)      # 1920x1152 coded: over budget
+        self.assertEqual(self.scaling.call_args.args, (1920, 1126, 4096, 4096, budget))
+        self.scaling.reset_mock()
+        self.select(settings, width=1920, height=1050)      # 1920x1056 coded: fits, cached
+        self.scaling.assert_called_once_with(1920, 1050, 4096, 4096)
+        self.scaling.reset_mock()
+        self.select(replace(settings, text_hint=True), width=1920, height=1126)
+        self.scaling.assert_called_once_with(1920, 1126, 4096, 4096)
+
     def test_selection_imports_without_gui_or_codec_plugins(self):
         script = """
 import sys
