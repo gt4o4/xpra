@@ -14,7 +14,7 @@ from xpra.codecs.loader import load_codec, codec_versions, has_codec, get_codec,
 from xpra.codecs.video import getVideoHelper
 from xpra.util.parsing import parse_bool_or_int
 from xpra.common import noop
-from xpra.client.gui.window.backing import VIDEO_MAX_SIZE
+from xpra.client.gui.window.backing import VIDEO_MAX_SIZE, VIDEO_MAX_PIXELS
 from xpra.net.common import Packet, FULL_INFO, BACKWARDS_COMPATIBLE
 from xpra.net import compression
 from xpra.util.objects import typedict
@@ -27,11 +27,23 @@ from xpra.util.thread import start_thread
 log = Logger("client", "encoding")
 
 CODEC_LOAD_TIMEOUT = envint("XPRA_CODEC_LOAD_TIMEOUT", 30)
-B_FRAMES = envbool("XPRA_B_FRAMES", True)
+# B-frame support advertisement: default OFF - the libva decoder is
+# P/I-only by doctrine (B-slices rejected at parse; display-order
+# reordering is out of scope), and the True default is a
+# dec_avcodec2-era fossil that made the server send B-frames straight
+# into whole-window MC garbage
+B_FRAMES = envbool("XPRA_B_FRAMES", False)
+# lossless refresh pinned to jpeg by default: q100 4:4:4 decodes on
+# the GPU via dec_gpujpeg (and via turbojpeg elsewhere) - without the
+# pin, png from the core encoding set could be chosen = CPU decode
+AUTO_REFRESH_ENCODINGS = tuple(x.strip() for x in os.environ.get("XPRA_AUTO_REFRESH_ENCODINGS", "jpeg").split(",") if x.strip())
 PAINT_FLUSH = envbool("XPRA_PAINT_FLUSH", True)
 MAX_SOFT_EXPIRED = envint("XPRA_MAX_SOFT_EXPIRED", 5)
 SEND_TIMESTAMPS = envbool("XPRA_SEND_TIMESTAMPS", False)
-SCROLL_ENCODING = envbool("XPRA_SCROLL_ENCODING", False)
+# scroll default ON (master flipped it False): needs BOTH this and a
+# "scroll" entry in --encodings; the two-switch trap silently dropped
+# terminal line-scrolls into per-line jpegs once already
+SCROLL_ENCODING = envbool("XPRA_SCROLL_ENCODING", True)
 
 # we assume that any server will support at least those:
 DEFAULT_ENCODINGS = os.environ.get("XPRA_DEFAULT_ENCODINGS", "rgb32,rgb24,jpeg,png").split(",")
@@ -47,7 +59,7 @@ def get_core_encodings() -> Sequence[str]:
     """
     # we always support rgb:
     core_encodings = ["rgb24", "rgb32"]
-    for codec in ("dec_pillow", "dec_webp", "dec_jpeg", "dec_nvjpeg", "dec_avif", "dec_jph"):
+    for codec in ("dec_pillow", "dec_webp", "dec_jpeg", "dec_gpujpeg", "dec_nvjpeg", "dec_avif", "dec_jph"):
         if has_codec(codec):
             c = get_codec(codec)
             encs = c.get_encodings()
@@ -91,7 +103,7 @@ class Encodings(StubClientSubsystem):
         "_codecs_loaded", "_codecs_lock", "allowed_encodings", "csc_modules", "encoding", "encoding_defaults",
         "min_quality", "min_speed", "quality", "server_core_encodings", "server_encodings",
         "server_encodings_with_lossless_mode", "server_encodings_with_quality", "server_encodings_with_speed",
-        "speed", "video_decoders", "video_max_size", "video_scaling",
+        "speed", "video_decoders", "video_max_pixels", "video_max_size", "video_scaling",
     )
     PREFIX = "encoding"
 
@@ -111,6 +123,7 @@ class Encodings(StubClientSubsystem):
         self.min_speed = -1
         self.video_scaling = None
         self.video_max_size = VIDEO_MAX_SIZE
+        self.video_max_pixels = VIDEO_MAX_PIXELS
         self.csc_modules: Sequence[str] = ()
         self.video_decoders: Sequence[str] = ()
 
@@ -219,6 +232,7 @@ class Encodings(StubClientSubsystem):
             # try to load the fast jpeg decoders:
             load_codec("dec_jpeg")
             if allow_hardware_jpeg:
+                load_codec("dec_gpujpeg")
                 load_codec("dec_nvjpeg")
                 load_codec("nvdec")
         if "webp" in ae:
@@ -322,10 +336,19 @@ class Encodings(StubClientSubsystem):
             "window-icon": self.get_window_icon_encodings(),
             "video_b_frames": video_b_frames,
             "video_max_size": self.video_max_size,
+            "video_max_pixels": self.video_max_pixels,
             "max-soft-expired": MAX_SOFT_EXPIRED,
             "send-timestamps": SEND_TIMESTAMPS,
             "eos": True,
         }
+        if AUTO_REFRESH_ENCODINGS:
+            # constrain which encodings the server may use for the
+            # lossless auto-refresh (the server-side handling of this
+            # capability has always existed - see client_refresh_encodings
+            # in the window source - but no client ever sent it): e.g. a
+            # client with a hardware jpeg decoder prefers jpeg refreshes
+            # over webp
+            caps["auto_refresh_encodings"] = AUTO_REFRESH_ENCODINGS
         if self.video_scaling is not None:
             caps["scaling.control"] = self.video_scaling
         if self.encoding:
