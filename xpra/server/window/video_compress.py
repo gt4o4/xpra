@@ -197,6 +197,7 @@ class WindowVideoSource(WindowSource):
         self.scroll_preference: int = self.encoding_options.intget("scrolling.preference", 100)
         self.supports_video_b_frames: Sequence[str] = self.encoding_options.strtupleget("video_b_frames", ())
         self.video_max_size = self.encoding_options.inttupleget("video_max_size", (8192, 8192), 2, 2)
+        self.video_max_pixels = self.encoding_options.intget("video_max_pixels", 0)
         self.video_stream_file = None
 
     def __repr__(self) -> str:
@@ -317,6 +318,7 @@ class WindowVideoSource(WindowSource):
             info["video_subregion"] = sri
         info["scaling"] = self.actual_scaling
         info["video-max-size"] = self.video_max_size
+        info["video-max-pixels"] = self.video_max_pixels
 
         def addcinfo(prefix, x) -> None:
             if not x:
@@ -1382,6 +1384,7 @@ class WindowVideoSource(WindowSource):
         min_s = self._fixed_min_speed
         text_hint = "text" in self.content_types
         max_size = (16384, 16384) if text_hint else self.video_max_size
+        max_pixels = 0 if text_hint else self.video_max_pixels
         vr = self.matches_video_subregion(width, height)
         if vr and target_q < 100 and not text_hint:
             video_fps = self.video_subregion.fps if self.subregion_is_video() else None
@@ -1389,7 +1392,7 @@ class WindowVideoSource(WindowSource):
             scorelog("adjusted quality target to %i for region %s (video fps=%s)", target_q, vr, video_fps)
         settings = PipelineSettings(
             quality=target_q, min_quality=min_q, speed=target_s, min_speed=min_s,
-            max_size=max_size, text_hint=text_hint, is_shadow=self.is_shadow,
+            max_size=max_size, max_pixels=max_pixels, text_hint=text_hint, is_shadow=self.is_shadow,
             force_csc=FORCE_CSC, force_csc_mode=FORCE_CSC_MODE, preferred_encodings=PREFERRED_ENCODING_ORDER,
         )
 
@@ -1437,7 +1440,8 @@ class WindowVideoSource(WindowSource):
                 return int(pixels/(width*height)/(now - otime))
         return 0
 
-    def calculate_scaling(self, width: int, height: int, max_w: int = 4096, max_h: int = 4096) -> tuple[int, int]:
+    def calculate_scaling(self, width: int, height: int, max_w: int = 4096, max_h: int = 4096,
+                          max_pixels: int = 0) -> tuple[int, int]:
         if width == 0 or height == 0:
             return 1, 1
         if not SCALING:
@@ -1448,7 +1452,7 @@ class WindowVideoSource(WindowSource):
             return 1, 1
         now = monotonic()
         state = ScalingState(
-            width=width, height=height, max_width=max_w, max_height=max_h,
+            width=width, height=height, max_width=max_w, max_height=max_h, max_pixels=max_pixels,
             client_render_size=self.client_render_size,
             control=self.scaling_control, requested_scaling=self.scaling,
             actual_scaling=self.actual_scaling,
@@ -1476,7 +1480,7 @@ class WindowVideoSource(WindowSource):
                 matches_subregion=matches_subregion, subregion_is_video=subregion_is_video,
             )
         scalinglog("calculate_scaling%s=%s (q=%s, s=%s, scaling_control=%s)",
-                   (width, height, max_w, max_h), scaling, state.quality, state.speed, state.control)
+                   (width, height, max_w, max_h, max_pixels), scaling, state.quality, state.speed, state.control)
         return scaling
 
     def check_pipeline(self, encodings: Sequence[str], width: int, height: int, src_format: str) -> bool:
