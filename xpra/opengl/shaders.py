@@ -160,15 +160,11 @@ def gen_NV12_FIELDS_to_RGB(cs="bt601", full_range=True) -> str:
     row parity (interop2, which can expose whole frames, does not
     exist on legacy drivers).
 
-    Scaling is fused into this pass (the viewport is the window
-    region, `scaling` maps fragments back to video texels): luma is
-    interpolated with 16-tap Catmull-Rom bicubic, chroma bilinear -
-    the hardware sampler cannot help because consecutive video rows
-    live in ALTERNATING field textures, so every tap goes through a
-    field-selecting fetch helper.  At 1:1 the sample positions are
-    exactly integral (t == 0) and a coherent fast path fetches the
-    single texel - bit-identical to the unscaled paint and skips the
-    20-tap cost in the common case."""
+    This shader serves the UNSCALED (1:1) paint only: sample
+    positions are exactly integral, so each fragment is one luma
+    fetch and one co-sited chroma fetch.  Scaled paints go through
+    the three-pass linear-light Lanczos pipeline instead
+    (NV12_FIELDS_to_LINEAR + lanczos_h + lanczos_v)."""
     if cs not in CS_MULTIPLIERS:
         raise ValueError(f"unsupported colorspace {cs}")
     a, b, c, d, e = CS_MULTIPLIERS[cs]
@@ -183,13 +179,6 @@ layout(origin_upper_left) in vec4 gl_FragCoord;
 uniform vec2 viewport_pos;
 uniform vec2 scaling;
 uniform vec2 vid_size;
-const float SIG_CENTER    = {_SIG_CENTER};
-const float SIG_SLOPE     = {_SIG_SLOPE};
-const float SIG_OFFSET    = {_SIG_OFFSET};
-const float SIG_SCALE     = {_SIG_SCALE};
-const float SIG_INV_SLOPE = {_SIG_INV_SLOPE};
-const float SIG_INV_SCALE = {_SIG_INV_SCALE};
-const float SIG_OFF_SCALE = {_SIG_OFF_SCALE};
 uniform sampler2DRect Y0;
 uniform sampler2DRect C0;
 uniform sampler2DRect Y1;
@@ -215,78 +204,13 @@ vec2 fC(float cx, float cr)
     return (mod(cr, 2.0) < 0.5) ? texture(C0, p).rg : texture(C1, p).rg;
 }}
 
-// Catmull-Rom weights for the 4 taps around parameter t in [0,1)
-vec4 cmr(float t)
-{{
-    float t2 = t * t;
-    float t3 = t2 * t;
-    return vec4(-0.5 * t3 +       t2 - 0.5 * t,
-                 1.5 * t3 - 2.5 * t2 + 1.0,
-                -1.5 * t3 + 2.0 * t2 + 0.5 * t,
-                 0.5 * t3 - 0.5 * t2);
-}}
-
-// sigmoidal transfer (scalar twin of the upscale shader's RGB pair):
-// interpolating in this space compresses the negative-lobe overshoot
-// Catmull-Rom produces at hard luma edges
-float sig_forward(float c)
-{{
-    c = clamp(c, 0.0, 1.0);
-    return SIG_CENTER - log(1.0 / (c * SIG_SCALE + SIG_OFFSET) - 1.0) * SIG_INV_SLOPE;
-}}
-
-float sig_inverse(float c)
-{{
-    return SIG_INV_SCALE / (1.0 + exp(SIG_SLOPE * (SIG_CENTER - c))) - SIG_OFF_SCALE;
-}}
-
 void main()
 {{
     vec2 pos = (gl_FragCoord.xy - viewport_pos.xy) / scaling;
-    vec2 s = pos - 0.5;              // texel-center space
+    vec2 s = pos - 0.5;              // texel-center space (integral at 1:1)
     vec2 base = floor(s);
-    vec2 t = s - base;
-    highp float y;
-    vec2 uv;
-    if (t == vec2(0.0)) {{
-        // 1:1 (or an exactly-integral sample): single-texel fetches,
-        // identical to the pre-scaling shader
-        y = fY(base.x, base.y);
-        uv = fC(floor(base.x * 0.5), floor(base.y * 0.5));
-    }} else {{
-        vec4 wx = cmr(t.x);
-        vec4 wy = cmr(t.y);
-        // 16-tap loop, upstream textureCatmullRom's shape: cache the
-        // inner 2x2 for anti-ringing, sigmoidize each tap (luma only -
-        // bilinear chroma has no negative lobes, nothing to ring)
-        float n00 = 0.0, n10 = 0.0, n01 = 0.0, n11 = 0.0;
-        y = 0.0;
-        for (int j = 0; j < 4; j++) {{
-            float r = base.y + float(j) - 1.0;
-            for (int i = 0; i < 4; i++) {{
-                float tap = fY(base.x + float(i) - 1.0, r);
-                if (i == 1 && j == 1) n00 = tap;
-                if (i == 2 && j == 1) n10 = tap;
-                if (i == 1 && j == 2) n01 = tap;
-                if (i == 2 && j == 2) n11 = tap;
-                y += sig_forward(tap) * wx[i] * wy[j];
-            }}
-        }}
-        y = sig_inverse(y);
-        // anti-ringing: pull overshoot back toward the inner
-        // neighborhood's range (same strength as the present upscaler)
-        float lo = min(min(n00, n10), min(n01, n11));
-        float hi = max(max(n00, n10), max(n01, n11));
-        y = mix(y, clamp(y, lo, hi), 0.8);
-        // chroma bilinear at MPEG-2 4:2:0 siting (left-cosited
-        // horizontally, midway vertically)
-        vec2 c = vec2(s.x * 0.5, s.y * 0.5 - 0.25);
-        vec2 cb = floor(c);
-        vec2 ct = c - cb;
-        uv = mix(mix(fC(cb.x,       cb.y), fC(cb.x + 1.0, cb.y), ct.x),
-                 mix(fC(cb.x, cb.y + 1.0), fC(cb.x + 1.0, cb.y + 1.0), ct.x),
-                 ct.y);
-    }}
+    highp float y = fY(base.x, base.y);
+    vec2 uv = fC(floor(base.x * 0.5), floor(base.y * 0.5));
     y = (y{yoffset}){ymult};
     highp float u = (uv.r - 0.5){umult};
     highp float v = (uv.g - 0.5){vmult};
@@ -296,6 +220,206 @@ void main()
     highp float b = y + {d} * u;
 
     frag_color = vec4(r, g, b, 1.0);
+}}
+"""
+
+
+def gen_NV12_FIELDS_to_LINEAR(cs="bt601", full_range=True) -> str:
+    """Pass 1 of the scaled VDPAU paint: at VIDEO resolution, turn the
+    four interop field textures into linear-light RGB in sigmoid space,
+    stored in a RGBA16 (unorm) intermediate.
+
+    Per video texel: exact-texel luma fetch, chroma upsampled bilinear
+    at MPEG-2 4:2:0 siting (co-sited horizontally, midway vertically),
+    Y'CbCr -> R'G'B' matrix, sRGB EOTF to linear, then the sigmoidal
+    transfer - so the Lanczos passes that follow (lanczos_h/lanczos_v)
+    interpolate photons in a ring-compressed space, stored in a
+    RGB10_A2 intermediate (10 bits suffice in sigmoid space)."""
+    if cs not in CS_MULTIPLIERS:
+        raise ValueError(f"unsupported colorspace {cs}")
+    a, b, c, d, e = CS_MULTIPLIERS[cs]
+    f = - c * d / b
+    g = - a * e / b
+    ymult = "" if full_range else " * 1.1643835616438356"
+    umult = vmult = "" if full_range else " * 1.1383928571428572"
+    yoffset = "" if full_range else " - 0.062745098"
+    return f"""
+#version {GLSL_VERSION}
+// default fragcoord origin: this pass renders 1:1 into an FBO whose
+// rows must match video image rows (row 0 = top) - flipping happens
+// only at the final pass, mirroring the 1:1 paint
+uniform vec2 vid_size;
+const float SIG_CENTER    = {_SIG_CENTER};
+const float SIG_SLOPE     = {_SIG_SLOPE};
+const float SIG_OFFSET    = {_SIG_OFFSET};
+const float SIG_SCALE     = {_SIG_SCALE};
+const float SIG_INV_SLOPE = {_SIG_INV_SLOPE};
+uniform sampler2DRect Y0;
+uniform sampler2DRect C0;
+uniform sampler2DRect Y1;
+uniform sampler2DRect C1;
+layout(location = 0) out vec4 frag_color;
+
+float fY(float x, float r)
+{{
+    r = clamp(r, 0.0, vid_size.y - 1.0);
+    vec2 p = vec2(x + 0.5, floor(r * 0.5) + 0.5);
+    return (mod(r, 2.0) < 0.5) ? texture(Y0, p).r : texture(Y1, p).r;
+}}
+
+vec2 fC(float cx, float cr)
+{{
+    // clamp BOTH axes to the video chroma region: the sampler's own
+    // CLAMP_TO_EDGE stops at the 32-aligned SURFACE edge, not the
+    // video edge - the bilinear +1 column tap would otherwise read
+    // alignment padding on the last luma column whenever the video
+    // width is even but not 32-aligned
+    cx = clamp(cx, 0.0, floor((vid_size.x - 1.0) * 0.5));
+    cr = clamp(cr, 0.0, floor((vid_size.y - 1.0) * 0.5));
+    vec2 p = vec2(cx + 0.5, floor(cr * 0.5) + 0.5);
+    return (mod(cr, 2.0) < 0.5) ? texture(C0, p).rg : texture(C1, p).rg;
+}}
+
+float srgb_eotf(float c)
+{{
+    return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}}
+
+float sig_forward(float c)
+{{
+    c = clamp(c, 0.0, 1.0);
+    return SIG_CENTER - log(1.0 / (c * SIG_SCALE + SIG_OFFSET) - 1.0) * SIG_INV_SLOPE;
+}}
+
+void main()
+{{
+    // one fragment per video texel (viewport = video dimensions)
+    vec2 s = gl_FragCoord.xy - 0.5;
+    highp float y = fY(s.x, s.y);
+    // chroma bilinear at MPEG-2 siting
+    vec2 c = vec2(s.x * 0.5, s.y * 0.5 - 0.25);
+    vec2 cb = floor(c);
+    vec2 ct = c - cb;
+    vec2 uv = mix(mix(fC(cb.x,       cb.y), fC(cb.x + 1.0, cb.y), ct.x),
+                  mix(fC(cb.x, cb.y + 1.0), fC(cb.x + 1.0, cb.y + 1.0), ct.x),
+                  ct.y);
+    y = (y{yoffset}){ymult};
+    highp float u = (uv.r - 0.5){umult};
+    highp float v = (uv.g - 0.5){vmult};
+    highp float r = clamp(y +           {e} * v, 0.0, 1.0);
+    highp float g = clamp(y + {f} * u + {g} * v, 0.0, 1.0);
+    highp float b = clamp(y + {d} * u, 0.0, 1.0);
+    frag_color = vec4(sig_forward(srgb_eotf(r)),
+                      sig_forward(srgb_eotf(g)),
+                      sig_forward(srgb_eotf(b)), 1.0);
+}}
+"""
+
+
+# Lanczos3 kernel + the shared 6-tap loop shape for the two resample
+# passes.  Plain (unstretched) Lanczos3: the paint path only ever
+# upscales in steady state (the server scales video DOWN to fit);
+# a transient window-shrink before the decoder restarts may briefly
+# downscale, mildly aliased for those frames - accepted.
+_LANCZOS_FN = """
+float lz(float x)
+{
+    x = abs(x);
+    if (x >= 3.0)
+        return 0.0;
+    if (x < 1e-5)
+        return 1.0;
+    float px = 3.14159265358979 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+"""
+
+LANCZOS_H_SHADER = f"""
+#version {GLSL_VERSION}
+// default fragcoord origin: intermediate-to-intermediate, rows stay
+// in image order
+uniform vec2 scaling;
+uniform vec2 vid_size;
+uniform sampler2DRect tex;
+layout(location = 0) out vec4 frag_color;
+{_LANCZOS_FN}
+void main()
+{{
+    // horizontal Lanczos3: output row = input row (pass renders at
+    // intermediate size out_w x vid_h); values are sigmoid-domain
+    float oy = gl_FragCoord.y - 0.5;
+    float ox = gl_FragCoord.x - 0.5;
+    float sx = (ox + 0.5) / scaling.x - 0.5;
+    float base = floor(sx);
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int i = -2; i <= 3; i++) {{
+        float tx = base + float(i);
+        float w = lz(sx - tx);
+        tx = clamp(tx, 0.0, vid_size.x - 1.0);
+        acc += w * texture(tex, vec2(tx + 0.5, oy + 0.5)).rgb;
+        wsum += w;
+    }}
+    frag_color = vec4(acc / wsum, 1.0);
+}}
+"""
+
+LANCZOS_V_SHADER = f"""
+#version {GLSL_VERSION}
+layout(origin_upper_left) in vec4 gl_FragCoord;
+uniform vec2 viewport_pos;
+uniform vec2 scaling;
+uniform vec2 vid_size;
+const float SIG_CENTER    = {_SIG_CENTER};
+const float SIG_SLOPE     = {_SIG_SLOPE};
+const float SIG_INV_SCALE = {_SIG_INV_SCALE};
+const float SIG_OFF_SCALE = {_SIG_OFF_SCALE};
+uniform sampler2DRect tex;
+layout(location = 0) out vec4 frag_color;
+{_LANCZOS_FN}
+vec3 sig_inverse(vec3 c)
+{{
+    return SIG_INV_SCALE / (1.0 + exp(SIG_SLOPE * (SIG_CENTER - c))) - SIG_OFF_SCALE;
+}}
+
+vec3 srgb_oetf(vec3 c)
+{{
+    c = clamp(c, 0.0, 1.0);
+    vec3 lin = 12.92 * c;
+    vec3 curved = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(curved, lin, lessThanEqual(c, vec3(0.0031308)));
+}}
+
+void main()
+{{
+    // vertical Lanczos3 + anti-ringing, then back out of sigmoid and
+    // linear light to sRGB for the window
+    vec2 pos = gl_FragCoord.xy - viewport_pos.xy;
+    float ox = pos.x - 0.5;
+    float oy = pos.y - 0.5;
+    float sy = (oy + 0.5) / scaling.y - 0.5;
+    float base = floor(sy);
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    vec3 n0 = vec3(0.0);
+    vec3 n1 = vec3(0.0);
+    for (int j = -2; j <= 3; j++) {{
+        float ty = base + float(j);
+        float w = lz(sy - ty);
+        ty = clamp(ty, 0.0, vid_size.y - 1.0);
+        vec3 tap = texture(tex, vec2(ox + 0.5, ty + 0.5)).rgb;
+        if (j == 0) n0 = tap;
+        if (j == 1) n1 = tap;
+        acc += w * tap;
+        wsum += w;
+    }}
+    vec3 val = acc / wsum;
+    // anti-ringing against the two bracketing rows (the horizontal
+    // pass's unorm storage already clamped horizontal overshoot)
+    vec3 lo = min(n0, n1);
+    vec3 hi = max(n0, n1);
+    val = mix(val, clamp(val, lo, hi), 0.8);
+    frag_color = vec4(srgb_oetf(sig_inverse(val)), 1.0);
 }}
 """
 
@@ -536,12 +660,15 @@ SOURCE: dict[str, str] = {
     "overlay": OVERLAY_SHADER,
     "fixed-color": FIXED_COLOR_SHADER,
     "upscale": UPSCALE_SHADER,
+    "lanczos_h": LANCZOS_H_SHADER,
+    "lanczos_v": LANCZOS_V_SHADER,
 }
 
 for full in (False, True):
     suffix = "_FULL" if full else ""
     SOURCE[f"NV12_to_RGB{suffix}"] = gen_NV12_to_RGB(full_range=full)
     SOURCE[f"NV12_FIELDS_to_RGB{suffix}"] = gen_NV12_FIELDS_to_RGB(full_range=full)
+    SOURCE[f"NV12_FIELDS_to_LINEAR{suffix}"] = gen_NV12_FIELDS_to_LINEAR(full_range=full)
     SOURCE[f"AYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="AYUV")
     SOURCE[f"XYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="XYUV")
     SOURCE[f"Y410_to_RGB{suffix}"] = gen_Y410_to_RGB(full_range=full)

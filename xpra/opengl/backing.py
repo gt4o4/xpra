@@ -286,6 +286,11 @@ class GLWindowBackingBase(WindowBackingBase):
         self.vdpau_device: int = 0
         self.vdpau_decoder = None           # decoder whose device is pinned by this backing
         self.vdpau_registrations: dict[int, tuple[int, tuple[int, ...]]] = {}
+        # 3-pass scaled-paint intermediates (RGBA16 rect textures):
+        # A = video-sized linear+sigmoid, B = horizontally scaled
+        self.vdpau_scale_size: tuple[int, int, int] | None = None
+        self.vdpau_scale_textures = None
+        self.vdpau_scale_fbos = None
         self.texture_size: tuple[int, int] = (0, 0)
         self.gl_setup = False
         self.debug_setup = False
@@ -1791,6 +1796,7 @@ class GLWindowBackingBase(WindowBackingBase):
         # its deallocator)
         decoder = self.vdpau_decoder
         self.vdpau_decoder = None
+        self.free_scale_pass_buffers()
         if self.vdpau_device:
             try:
                 glFinish()
@@ -1904,9 +1910,133 @@ class GLWindowBackingBase(WindowBackingBase):
         img.free()
         fire_paint_callbacks(callbacks, False, message)
 
+    def ensure_scale_pass_buffers(self, vw: int, vh: int, out_w: int) -> None:
+        # the two intermediates of the scaled paint, (re)allocated when
+        # the video or output geometry changes (ie: decoder restart) -
+        # RGB10_A2: values are in SIGMOID space, where 10 bits keep the
+        # final display error under an 8-bit LSB (the inverse sigmoid
+        # is compressive exactly where the sRGB OETF is steep), and the
+        # 4-byte texel HALVES the tap-read bandwidth of the resample
+        # passes vs a 16-bit format; overshoot still clamps at storage
+        want = (vw, vh, out_w)
+        if self.vdpau_scale_size == want:
+            return
+        self.free_scale_pass_buffers()
+        target = GL_TEXTURE_RECTANGLE
+        self.vdpau_scale_textures = glGenTextures(2)
+        self.vdpau_scale_fbos = glGenFramebuffers(2)
+        for idx, (tw, th) in enumerate(((vw, vh), (out_w, vh))):
+            glBindTexture(target, self.vdpau_scale_textures[idx])
+            glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexImage2D(target, 0, GL_RGB10_A2, tw, th, 0, GL_RGBA,
+                         GL_UNSIGNED_INT_2_10_10_10_REV, None)
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.vdpau_scale_fbos[idx])
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target,
+                                   self.vdpau_scale_textures[idx], 0)
+        glBindTexture(target, 0)
+        self.vdpau_scale_size = want
+        log("scaled-paint intermediates: %ix%i + %ix%i RGB10_A2", vw, vh, out_w, vh)
+
+    def free_scale_pass_buffers(self) -> None:
+        if self.vdpau_scale_fbos is not None:
+            glDeleteFramebuffers(2, self.vdpau_scale_fbos)
+            self.vdpau_scale_fbos = None
+        if self.vdpau_scale_textures is not None:
+            glDeleteTextures(self.vdpau_scale_textures)
+            self.vdpau_scale_textures = None
+        self.vdpau_scale_size = None
+
+    def draw_pass_quad(self) -> None:
+        position = 0
+        pos_buffer = self.set_vao(position)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glDeleteBuffers(1, [pos_buffer])
+        glDisableVertexAttribArray(position)
+        glBindVertexArray(0)
+
+    def render_vdpau_fields_scaled(self, textures: tuple[int, ...],
+                                   rx: int, ry: int, rw: int, rh: int,
+                                   width: int, height: int, full_range: bool) -> None:
+        # three-pass linear-light Lanczos3 scaled paint:
+        #  P1  fields -> linear RGB in sigmoid space, at video size
+        #  P2  horizontal Lanczos3           (video -> out_w x rh)
+        #  P3  vertical Lanczos3 + AR, inverse sigmoid, sRGB OETF,
+        #      into the offscreen backing FBO at the window region
+        # P1/P2 render with the default fragcoord origin so the
+        # intermediates keep video row order; P3 renders exactly like
+        # the 1:1 path (origin_upper_left + flipped viewport), which
+        # the present stage unflips.
+        target = GL_TEXTURE_RECTANGLE
+        self.ensure_scale_pass_buffers(rw, rh, width)
+        # pass 1
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.vdpau_scale_fbos[0])
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glViewport(0, 0, rw, rh)
+        program = self.programs.get("NV12_FIELDS_to_LINEAR" + ("_FULL" if full_range else ""))
+        if not program:
+            raise RuntimeError("no NV12_FIELDS_to_LINEAR program!")
+        glUseProgram(program)
+        units = (GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3)
+        names = ("Y0", "Y1", "C0", "C1")
+        for i, (unit, name) in enumerate(zip(units, names)):
+            glActiveTexture(unit)
+            glBindTexture(target, textures[i])
+            glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            glUniform1i(glGetUniformLocation(program, name), i)
+        glUniform2f(glGetUniformLocation(program, "vid_size"), rw, rh)
+        self.draw_pass_quad()
+        for unit in units:
+            glActiveTexture(unit)
+            glBindTexture(target, 0)
+        glActiveTexture(GL_TEXTURE0)
+        # pass 2
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.vdpau_scale_fbos[1])
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        glViewport(0, 0, width, rh)
+        program = self.programs.get("lanczos_h")
+        if not program:
+            raise RuntimeError("no lanczos_h program!")
+        glUseProgram(program)
+        glBindTexture(target, self.vdpau_scale_textures[0])
+        glUniform1i(glGetUniformLocation(program, "tex"), 0)
+        glUniform2f(glGetUniformLocation(program, "scaling"), width / rw, 1.0)
+        glUniform2f(glGetUniformLocation(program, "vid_size"), rw, rh)
+        self.draw_pass_quad()
+        # pass 3
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.offscreen_fbo)
+        glBindTexture(target, self.textures[TEX_FBO])
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target,
+                               self.textures[TEX_FBO], 0)
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        w, h = self.size
+        glViewport(min(w, max(0, rx)), min(h, max(0, h - ry - height)),
+                   min(w, max(0, width)), min(h, max(0, height)))
+        program = self.programs.get("lanczos_v")
+        if not program:
+            raise RuntimeError("no lanczos_v program!")
+        glUseProgram(program)
+        glBindTexture(target, self.vdpau_scale_textures[1])
+        glUniform1i(glGetUniformLocation(program, "tex"), 0)
+        glUniform2f(glGetUniformLocation(program, "viewport_pos"), rx, ry)
+        glUniform2f(glGetUniformLocation(program, "scaling"), 1.0, height / rh)
+        glUniform2f(glGetUniformLocation(program, "vid_size"), width, rh)
+        self.draw_pass_quad()
+        glUseProgram(0)
+        glBindTexture(target, 0)
+
     def render_vdpau_fields(self, textures: tuple[int, ...],
                             rx: int, ry: int, rw: int, rh: int, width: int, height: int,
                             shader="NV12_FIELDS_to_RGB") -> None:
+        if width != rw or height != rh:
+            self.render_vdpau_fields_scaled(textures, rx, ry, rw, rh, width, height,
+                                            shader.endswith("_FULL"))
+            return
+        # back at 1:1: the scaled-paint intermediates are dead weight
+        # (~16MB VRAM) until the next scaled paint - release them
+        if self.vdpau_scale_size is not None:
+            self.free_scale_pass_buffers()
         # modeled on render_planar_update, but sampling the 4 interop
         # field textures (uniforms Y0,C0,Y1,C1)
         target = GL_TEXTURE_RECTANGLE
