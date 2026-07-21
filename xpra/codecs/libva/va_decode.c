@@ -52,17 +52,30 @@ struct VP8State;
 /* H.264 decoded picture buffer: up to 16 reference frames (spec DPB
  * ceiling), progressive only (field coding is rejected at parse). */
 #define H264_DPB_SIZE 16
-/* surface pool: every DPB slot + the picture being decoded + slack for
- * frames exported to the GL painter (zero-copy path) that have not
- * been released yet.  15 fills the whole 32-bit occupancy word: pool
- * exhaustion (decode failure + decoder restart) then needs a full
- * 16-reference DPB AND 15 unreleased exports at once */
-#define H264_EXPORT_SLACK 15
+/* export slack: frames handed to the GL painter (zero-copy path) not
+ * yet released.  Steady-state is 1-2 in flight, but a window resize
+ * stalls the paint pipeline (GL backing re-init) while the server
+ * keeps sending, so decode runs ahead and pins pile up.  MEASURED
+ * (two-window gears, maximize/unmaximize cycles): slack 3 = a
+ * restart storm on every maximize (8 pool-exhaustions + 38 mid-GOP
+ * slice errors cascading until the next IDR, ~15 decoder
+ * generations); slack 5 = occasional single exhaustion per couple
+ * of cycles; slack 8 = clean.  Exhaustion stays a decode error +
+ * restart, never corruption - but every restart is create/destroy
+ * churn on the fragile decode engine, so buy it out with 3 more
+ * NV12 frames of VRAM (9MB at 1856x1088). */
+#define H264_EXPORT_SLACK 8
+/* the surface ARRAYS are sized for the worst case (a full spec DPB);
+ * the pool actually ALLOCATED is sized from the stream's own SPS at
+ * first decode: max_num_ref_frames + 1 current + slack - an nvenc
+ * nrf=3 stream gets 12 surfaces instead of 25 (VRAM: each surface is
+ * a full NV12 frame) */
 #define H264_NUM_SURFACES (H264_DPB_SIZE + 1 + H264_EXPORT_SLACK)
 _Static_assert(H264_NUM_SURFACES <= 32, "pinned_bits and dpb_used are 32-bit sets");
 
+/* describes the reference picture held by surfaces[i] - the surface
+ * id itself lives ONLY in surfaces[] (same index, no duplication) */
 struct H264DPBEntry {
-    VASurfaceID surface;
     int frame_num;              /* FrameNum as coded */
     int top_foc;
     int bottom_foc;
@@ -105,9 +118,11 @@ struct LibVADecoder {
     int             output_444;
     unsigned long   frames;
     /* DPB metadata, parallel to surfaces[]: dpb[i] describes the
-     * reference picture held by surfaces[i].  The 1:1 mapping is
-     * guaranteed by progressive-only decode (a frame owns its whole
-     * surface; a field pair sharing one would break bit-per-surface) */
+     * reference picture held by surfaces[i] (which alone owns the
+     * surface id - VA wants surfaces[] contiguous, so the entry does
+     * not duplicate it).  The 1:1 mapping is guaranteed by
+     * progressive-only decode (a frame owns its whole surface; a
+     * field pair sharing one would break bit-per-surface) */
     struct H264DPBEntry dpb[H264_NUM_SURFACES];
     /* bit i set = surfaces[i] holds a reference picture - the SAME
      * index space as pinned_bits, so the picker's busy set is one OR.
@@ -625,13 +640,43 @@ static void destroy_buffers(LibVADecoder *dec, VABufferID *buffers, int count) {
     }
 }
 
+/* allocate dec->num_surfaces surfaces + the VA context; for h264 this
+ * runs at FIRST DECODE (the pool is sized from the stream's SPS),
+ * for vp8/vp9 at create */
+static LibVADecodeStatus alloc_surfaces_and_context(LibVADecoder *dec) {
+    VASurfaceAttrib surface_attrs[2];
+    VAStatus status;
+    memset(surface_attrs, 0, sizeof(surface_attrs));
+    surface_attrs[0].type = VASurfaceAttribPixelFormat;
+    surface_attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    surface_attrs[0].value.type = VAGenericValueTypeInteger;
+    surface_attrs[0].value.value.i = dec->output_444 ? VA_FOURCC_444P : VA_FOURCC_NV12;
+    surface_attrs[1].type = VASurfaceAttribUsageHint;
+    surface_attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    surface_attrs[1].value.type = VAGenericValueTypeInteger;
+    surface_attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
+    status = vaCreateSurfaces(dec->display, dec->rt_format,
+                              (unsigned int)dec->surface_width,
+                              (unsigned int)dec->surface_height,
+                              dec->surfaces, (unsigned int)dec->num_surfaces,
+                              surface_attrs, 2);
+    if (status != VA_STATUS_SUCCESS)
+        return set_error(dec, status, "vaCreateSurfaces");
+    status = vaCreateContext(dec->display, dec->config,
+                             dec->surface_width, dec->surface_height,
+                             VA_PROGRESSIVE, dec->surfaces, dec->num_surfaces,
+                             &dec->context);
+    if (status != VA_STATUS_SUCCESS)
+        return set_error(dec, status, "vaCreateContext");
+    return LIBVA_DEC_OK;
+}
+
 LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
                                        int width, int height, const char *colorspace) {
     LibVACodec codec;
     LibVADecoder *dec;
     VAStatus status;
     VAConfigAttrib attr;
-    VASurfaceAttrib surface_attrs[2];
     int major = 0, minor = 0;
 
     if (!out)
@@ -665,11 +710,11 @@ LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
     dec->fd = -1;
     dec->config = VA_INVALID_ID;
     dec->context = VA_INVALID_ID;
-    dec->num_surfaces = codec == LIBVA_CODEC_H264 ? H264_NUM_SURFACES : 4;
+    /* h264 sizes its pool from the stream's SPS at first decode;
+     * vp8/vp9 keep their fixed 4-surface rotation allocated here */
+    dec->num_surfaces = codec == LIBVA_CODEC_H264 ? 0 : 4;
     for (int i = 0; i < H264_NUM_SURFACES; i++)
         dec->surfaces[i] = VA_INVALID_SURFACE;
-    for (int i = 0; i < H264_NUM_SURFACES; i++)
-        dec->dpb[i].surface = VA_INVALID_SURFACE;
     for (int i = 0; i < 8; i++)
         dec->vp9_refs[i] = VA_INVALID_SURFACE;
     dec->vpx_last_surface = -1;
@@ -740,45 +785,34 @@ LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
     {
         VASurfaceAttrib qattrs[32];
         unsigned int nq = 32;
+        /* zero the array: drivers only write the entries they report,
+         * and a stale stack entry whose type happened to equal
+         * PixelFormat printed garbage fourccs (seen live with the
+         * VDPAU bridge) - zeroed entries have type VASurfaceAttribNone */
+        memset(qattrs, 0, sizeof(qattrs));
         VAStatus qst = vaQuerySurfaceAttributes(dec->display, dec->config, qattrs, &nq);
-        libva_log("VP9 dbg: vaQuerySurfaceAttributes status=%d nattrs=%u", (int)qst, nq);
-        for (unsigned int i = 0; i < nq && qst == VA_STATUS_SUCCESS; i++) {
+        libva_log("surface probe: vaQuerySurfaceAttributes status=%d nattrs=%u", (int)qst, nq);
+        if (qst == VA_STATUS_SUCCESS && nq > 32)
+            nq = 32;
+        for (unsigned int i = 0; qst == VA_STATUS_SUCCESS && i < nq; i++) {
             if (qattrs[i].type == VASurfaceAttribPixelFormat) {
                 unsigned int fourcc = (unsigned int)qattrs[i].value.value.i;
-                libva_log("VP9 dbg:   supported pixel format: %c%c%c%c (0x%08x)",
-                          fourcc & 0xff, (fourcc >> 8) & 0xff,
-                          (fourcc >> 16) & 0xff, (fourcc >> 24) & 0xff, fourcc);
+                char c[4];
+                for (int b = 0; b < 4; b++) {
+                    unsigned char ch = (unsigned char)((fourcc >> (8 * b)) & 0xff);
+                    c[b] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                }
+                libva_log("surface probe:   supported pixel format: %c%c%c%c (0x%08x)",
+                          c[0], c[1], c[2], c[3], fourcc);
             }
         }
     }
-    memset(surface_attrs, 0, sizeof(surface_attrs));
-    surface_attrs[0].type = VASurfaceAttribPixelFormat;
-    surface_attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    surface_attrs[0].value.type = VAGenericValueTypeInteger;
-    surface_attrs[0].value.value.i = dec->output_444 ? VA_FOURCC_444P : VA_FOURCC_NV12;
-    surface_attrs[1].type = VASurfaceAttribUsageHint;
-    surface_attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    surface_attrs[1].value.type = VAGenericValueTypeInteger;
-    surface_attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
-    status = vaCreateSurfaces(dec->display, dec->rt_format,
-                              (unsigned int)dec->surface_width,
-                              (unsigned int)dec->surface_height,
-                              dec->surfaces, (unsigned int)dec->num_surfaces,
-                              surface_attrs, 2);
-    if (status != VA_STATUS_SUCCESS) {
-        set_error(dec, status, "vaCreateSurfaces");
-        libva_decoder_destroy(dec);
-        return LIBVA_DEC_ERROR;
-    }
-
-    status = vaCreateContext(dec->display, dec->config,
-                             dec->surface_width, dec->surface_height,
-                             VA_PROGRESSIVE, dec->surfaces, dec->num_surfaces,
-                             &dec->context);
-    if (status != VA_STATUS_SUCCESS) {
-        set_error(dec, status, "vaCreateContext");
-        libva_decoder_destroy(dec);
-        return LIBVA_DEC_ERROR;
+    if (dec->num_surfaces > 0) {
+        LibVADecodeStatus astatus = alloc_surfaces_and_context(dec);
+        if (astatus != LIBVA_DEC_OK) {
+            libva_decoder_destroy(dec);
+            return astatus;
+        }
     }
 
     libva_log("libva %s decoder create: %dx%d surface=%dx%d colorspace=%s profile=%s device=%s vendor=%s",
@@ -1143,9 +1177,9 @@ static int parse_h264_dec_ref_pic_marking(struct BitReader *br, int nal_type,
 /* ------------------------------------------------------------------ */
 
 static void h264_dpb_flush(LibVADecoder *dec) {
+    /* emptiness is the bitmap alone - entry fields are void while
+     * their dpb_used bit is clear */
     dec->dpb_used = 0;
-    for (int i = 0; i < H264_NUM_SURFACES; i++)
-        dec->dpb[i].surface = VA_INVALID_SURFACE;
 }
 
 /* PicNum for a frame (spec 8.2.4.1: FrameNumWrap, since for frames
@@ -1327,14 +1361,13 @@ static void h264_dpb_apply_mmco(LibVADecoder *dec, const struct H264Params *para
     }
 }
 
-static void h264_dpb_insert(LibVADecoder *dec, int surface_index, VASurfaceID surface,
+static void h264_dpb_insert(LibVADecoder *dec, int surface_index,
                             int frame_num, int top_foc, int bottom_foc,
                             int is_long_term, int lt_idx) {
     /* the slot IS the surface index (dpb[] is parallel to surfaces[]);
      * its bit is clear by construction: the picker refuses surfaces
      * that are still referenced or pinned */
     struct H264DPBEntry *e = &dec->dpb[surface_index];
-    e->surface = surface;
     e->frame_num = frame_num;
     e->top_foc = top_foc;
     e->bottom_foc = bottom_foc;
@@ -1343,8 +1376,9 @@ static void h264_dpb_insert(LibVADecoder *dec, int surface_index, VASurfaceID su
     dec->dpb_used |= 1u << surface_index;
 }
 
-static void h264_fill_va_picture(VAPictureH264 *p, const struct H264DPBEntry *e) {
-    p->picture_id = e->surface;
+static void h264_fill_va_picture(VAPictureH264 *p, const LibVADecoder *dec, int slot) {
+    const struct H264DPBEntry *e = &dec->dpb[slot];
+    p->picture_id = dec->surfaces[slot];
     if (e->is_long_term) {
         p->frame_idx = (uint32_t)e->long_term_frame_idx;
         p->flags = VA_PICTURE_H264_LONG_TERM_REFERENCE;
@@ -2646,6 +2680,40 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
 
     for (int i = 0; i < (int)(sizeof(buffers) / sizeof(buffers[0])); i++)
         buffers[i] = VA_INVALID_ID;
+    {
+        /* the pool is sized from the stream itself: SPS
+         * max_num_ref_frames + the current picture + export slack.
+         * Surfaces are full NV12 frames of VRAM, so provisioning the
+         * spec worst case (16 refs) for every stream is expensive -
+         * nvenc emits 3. */
+        int refs = params.valid_sps ? params.max_num_ref_frames : 0;
+        if (refs < 1)
+            refs = 1;
+        if (refs > H264_DPB_SIZE)
+            refs = H264_DPB_SIZE;
+        int needed = refs + 1 + H264_EXPORT_SLACK;
+        if (dec->context == VA_INVALID_ID) {
+            if (!params.valid_sps)
+                return set_message(dec, LIBVA_DEC_ERROR,
+                                   "no SPS before the first slice");
+            dec->num_surfaces = needed;
+            LibVADecodeStatus astatus = alloc_surfaces_and_context(dec);
+            if (astatus != LIBVA_DEC_OK)
+                return astatus;
+            libva_log("libva h264: allocated %d surfaces (%d reference frames + 1 + %d export slack)",
+                      dec->num_surfaces, refs, H264_EXPORT_SLACK);
+        } else if (needed > dec->num_surfaces) {
+            /* a mid-stream SPS raised max_num_ref_frames beyond the
+             * pool: fail loudly - the CodecStateException restart
+             * re-sizes from the new SPS */
+            snprintf(dec->last_error, sizeof(dec->last_error),
+                     "stream now declares %d reference frames, pool has %d surfaces",
+                     refs, dec->num_surfaces);
+            dec->last_status = (int)LIBVA_DEC_ERROR;
+            libva_log("libva decode error: %s", dec->last_error);
+            return LIBVA_DEC_ERROR;
+        }
+    }
     is_idr = first->nal_type == 5;
     if (params.pic_order_cnt_type == 1)
         return set_message(dec, LIBVA_DEC_UNSUPPORTED,
@@ -2678,7 +2746,7 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
     {
         int n = 0;
         for (uint32_t refs = dec->dpb_used; refs && n < 16; refs &= refs - 1)
-            h264_fill_va_picture(&pic.ReferenceFrames[n++], &dec->dpb[__builtin_ctz(refs)]);
+            h264_fill_va_picture(&pic.ReferenceFrames[n++], dec, __builtin_ctz(refs));
     }
     if (params.valid_sps &&
         ((params.width_mbs_minus1 + 1) * 16 > dec->surface_width ||
@@ -2777,7 +2845,7 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
             struct H264DPBEntry *l0[32];
             int nl0 = h264_build_ref_list_l0(dec, &params, si, l0, 32);
             for (int i = 0; i < nl0; i++)
-                h264_fill_va_picture(&slice.RefPicList0[i], l0[i]);
+                h264_fill_va_picture(&slice.RefPicList0[i], dec, (int)(l0[i] - dec->dpb));
         }
         status = vaCreateBuffer(dec->display, dec->context, VASliceParameterBufferType,
                                 sizeof(slice), 1, &slice, &buffers[nbuf++]);
@@ -2835,7 +2903,7 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
             dec->poc_prev_frame_num = 0;
             dec->poc_prev_frame_num_offset = 0;
         }
-        h264_dpb_insert(dec, surface_index, surface, ins_frame_num,
+        h264_dpb_insert(dec, surface_index, ins_frame_num,
                         top_foc, bottom_foc, cur_is_lt, cur_lt_idx);
     }
     dec->frames++;

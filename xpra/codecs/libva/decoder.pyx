@@ -211,6 +211,17 @@ cdef bint supports(str encoding, str colorspace):
 # driver limits, overridable for hardware whose VA driver cannot
 # express them (ie: the VDPAU bridge on feature-set-A NVIDIA: H264
 # maxes at 2048x2048 AND 8192 macroblocks = 2097152 pixels):
+# 0 = unlimited: concurrent in-process streams are safe now that
+# surfaces are 32-aligned - the historical cross-stream luma
+# corruption was VP2 writing 32-aligned rows past under-aligned
+# surfaces into the NEIGHBOR stream's VRAM (retested lock-free:
+# two streams, ~10k frames + churn, pixel-perfect).  Surface pools
+# are SPS-sized so each extra stream costs only what it uses.
+# NOTE: any FINITE value here loses the
+# choose_decoder scoring tie to a zero-cost software decoder once one
+# instance is live (squared utilization penalty) - use 1 to gate, 0 to
+# allow multi-stream; intermediate values behave like 1 in practice.
+MAX_INSTANCES = envint("XPRA_LIBVA_MAX_INSTANCES", 0)
 MAX_WIDTH = envint("XPRA_LIBVA_MAX_WIDTH", 8192)
 MAX_HEIGHT = envint("XPRA_LIBVA_MAX_HEIGHT", 8192)
 MAX_PIXELS = envint("XPRA_LIBVA_MAX_PIXELS", 0)
@@ -245,8 +256,9 @@ def get_specs() -> Sequence[VideoSpec]:
                 # engine's per-channel state (measured: whole-frame Y
                 # damage on 13-41% of frames, chroma bit-exact).  The
                 # selection layer routes additional streams to the next
-                # decoder (ie: openh264) while one is live.
-                max_instances=1,
+                # decoder (ie: openh264) while one is live.  The env
+                # is live when a finite cap is set.
+                max_instances=MAX_INSTANCES,
                 min_w=64, min_h=64,
                 width_mask=0xFFFF, height_mask=0xFFFF,
                 max_w=MAX_WIDTH, max_h=MAX_HEIGHT,
