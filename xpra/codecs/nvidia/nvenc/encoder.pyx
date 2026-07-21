@@ -1085,6 +1085,12 @@ cdef class Encoder:
         vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709
         vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SRGB
         vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M
+        # chroma siting: type 0 (MPEG-2: co-sited horizontally,
+        # centered vertically) - what the kernels emit and what
+        # siting-aware scalers assume
+        vui.chromaSampleLocationFlag = 1
+        vui.chromaSampleLocationTop = 0
+        vui.chromaSampleLocationBot = 0
 
     cdef void tune_hevc(self, NV_ENC_CONFIG_HEVC *hevc, int gopLength):
         hevc.chromaFormatIDC = self.get_chroma_format()
@@ -1106,6 +1112,9 @@ cdef class Encoder:
         vui.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709
         vui.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_SRGB
         vui.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_SMPTE170M
+        vui.chromaSampleLocationFlag = 1
+        vui.chromaSampleLocationTop = 0
+        vui.chromaSampleLocationBot = 0
 
     cdef void tune_av1(self, NV_ENC_CONFIG_AV1 *av1, int gopLength):
         memset(av1, 0, sizeof(NV_ENC_CONFIG_AV1))
@@ -1717,19 +1726,31 @@ cdef class Encoder:
         #a grid is a group of blocks: (gridw * gridh) blocks
         cdef uint32_t blockw = 32
         cdef uint32_t blockh = 32
-        #cover the whole aligned output so the kernels can edge-extend the padding:
+        # the grid covers the OUTPUT (padded coded frame): the kernel
+        # GATHERS from the source and writes every coded pixel
+        # ("scale into the padding" - content fills the 32-alignment
+        # padding rather than wasting coded bits on dead rows)
         cdef uint32_t gridw = MAX(1, (self.encoder_width + blockw*dx - 1)//(blockw*dx))
         cdef uint32_t gridh = MAX(1, (self.encoder_height + blockh*dy - 1)//(blockh*dy))
-        cdef unsigned int in_w = self.input_width
-        cdef unsigned int in_h = self.input_height
+        # source valid dims are always the true image dims; the last
+        # two kernel arguments are the CONTENT dims within the padded
+        # coded frame: when scaling, content fills the whole padded
+        # frame ("scale into the padding" - and scaled_size reports
+        # the padded size to the client, so its crop matches); when
+        # NOT scaling, content stays 1:1 at the true size and the
+        # kernel edge-extends the padding (the client crops exactly
+        # the 1:1 region, having received no scaled_size)
+        cdef unsigned int in_w = w
+        cdef unsigned int in_h = h
+        cdef unsigned int content_w = w
+        cdef unsigned int content_h = h
         if self.scaling:
-            #scaling so scale exact dimensions, not padded input dimensions:
-            in_w, in_h = w, h
+            content_w, content_h = self.encoder_width, self.encoder_height
 
         cdef double start = monotonic()
         args = (self.cudaInputBuffer, numpy.int32(in_w), numpy.int32(in_h), numpy.int32(stride),
                self.cudaOutputBuffer, numpy.int32(self.encoder_width), numpy.int32(self.encoder_height), numpy.int32(self.outputPitch),
-               numpy.int32(w), numpy.int32(h))
+               numpy.int32(content_w), numpy.int32(content_h))
         if DEBUG_API:
             def lf(v):
                 if isinstance(v, driver.DeviceAllocation):
