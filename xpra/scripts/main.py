@@ -1563,7 +1563,14 @@ def handle_client_encoding_option(app, encoding: str) -> str:
     if not features.encoding:
         return ""
     einfo = ""
-    encodings = list(app.get_encodings()) + ["auto", "stream"]
+    # subsystems are composed instances, not part of the client's MRO
+    # (see UIXpraClient) - `get_encodings` lives on the "encoding"
+    # subsystem, and clients built without it (or before init) simply
+    # skip the validation
+    encodings_subsystem = app.get_subsystem("encoding")
+    if not encodings_subsystem:
+        return encoding
+    encodings = list(encodings_subsystem.get_encodings()) + ["auto", "stream"]
     err = encoding not in encodings
     ehelp = encoding == "help"
     if err and not ehelp:
