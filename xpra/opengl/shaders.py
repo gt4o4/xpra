@@ -152,6 +152,154 @@ void main()
 """
 
 
+def gen_NV12_FIELDS_to_RGB(cs="bt601", full_range=True) -> str:
+    """NV12 delivered as two interlaced FIELDS of separate luma+chroma
+    textures - the shape GL_NV_vdpau_interop (v1) gives a registered
+    VdpVideoSurface: tex 0/1 = top/bottom-field luma, tex 2/3 =
+    top/bottom-field chroma.  Progressive frames interleave back by
+    row parity (interop2, which can expose whole frames, does not
+    exist on legacy drivers).
+
+    Scaling is fused into this pass (the viewport is the window
+    region, `scaling` maps fragments back to video texels): luma is
+    interpolated with 16-tap Catmull-Rom bicubic, chroma bilinear -
+    the hardware sampler cannot help because consecutive video rows
+    live in ALTERNATING field textures, so every tap goes through a
+    field-selecting fetch helper.  At 1:1 the sample positions are
+    exactly integral (t == 0) and a coherent fast path fetches the
+    single texel - bit-identical to the unscaled paint and skips the
+    20-tap cost in the common case."""
+    if cs not in CS_MULTIPLIERS:
+        raise ValueError(f"unsupported colorspace {cs}")
+    a, b, c, d, e = CS_MULTIPLIERS[cs]
+    f = - c * d / b
+    g = - a * e / b
+    ymult = "" if full_range else " * 1.1643835616438356"
+    umult = vmult = "" if full_range else " * 1.1383928571428572"
+    yoffset = "" if full_range else " - 0.062745098"
+    return f"""
+#version {GLSL_VERSION}
+layout(origin_upper_left) in vec4 gl_FragCoord;
+uniform vec2 viewport_pos;
+uniform vec2 scaling;
+uniform vec2 vid_size;
+const float SIG_CENTER    = {_SIG_CENTER};
+const float SIG_SLOPE     = {_SIG_SLOPE};
+const float SIG_OFFSET    = {_SIG_OFFSET};
+const float SIG_SCALE     = {_SIG_SCALE};
+const float SIG_INV_SLOPE = {_SIG_INV_SLOPE};
+const float SIG_INV_SCALE = {_SIG_INV_SCALE};
+const float SIG_OFF_SCALE = {_SIG_OFF_SCALE};
+uniform sampler2DRect Y0;
+uniform sampler2DRect C0;
+uniform sampler2DRect Y1;
+uniform sampler2DRect C1;
+layout(location = 0) out vec4 frag_color;
+
+// fetch luma video row r, texel column x: clamp the VIDEO row first
+// (a tap clamped after the field split would land in the wrong field),
+// then split by parity into the half-height field texture
+float fY(float x, float r)
+{{
+    r = clamp(r, 0.0, vid_size.y - 1.0);
+    vec2 p = vec2(x + 0.5, floor(r * 0.5) + 0.5);
+    return (mod(r, 2.0) < 0.5) ? texture(Y0, p).r : texture(Y1, p).r;
+}}
+
+// fetch chroma-plane row cr, texel column cx (chroma plane is also
+// field-split; columns clamp via the sampler's CLAMP_TO_EDGE)
+vec2 fC(float cx, float cr)
+{{
+    cr = clamp(cr, 0.0, floor((vid_size.y - 1.0) * 0.5));
+    vec2 p = vec2(cx + 0.5, floor(cr * 0.5) + 0.5);
+    return (mod(cr, 2.0) < 0.5) ? texture(C0, p).rg : texture(C1, p).rg;
+}}
+
+// Catmull-Rom weights for the 4 taps around parameter t in [0,1)
+vec4 cmr(float t)
+{{
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return vec4(-0.5 * t3 +       t2 - 0.5 * t,
+                 1.5 * t3 - 2.5 * t2 + 1.0,
+                -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+                 0.5 * t3 - 0.5 * t2);
+}}
+
+// sigmoidal transfer (scalar twin of the upscale shader's RGB pair):
+// interpolating in this space compresses the negative-lobe overshoot
+// Catmull-Rom produces at hard luma edges
+float sig_forward(float c)
+{{
+    c = clamp(c, 0.0, 1.0);
+    return SIG_CENTER - log(1.0 / (c * SIG_SCALE + SIG_OFFSET) - 1.0) * SIG_INV_SLOPE;
+}}
+
+float sig_inverse(float c)
+{{
+    return SIG_INV_SCALE / (1.0 + exp(SIG_SLOPE * (SIG_CENTER - c))) - SIG_OFF_SCALE;
+}}
+
+void main()
+{{
+    vec2 pos = (gl_FragCoord.xy - viewport_pos.xy) / scaling;
+    vec2 s = pos - 0.5;              // texel-center space
+    vec2 base = floor(s);
+    vec2 t = s - base;
+    highp float y;
+    vec2 uv;
+    if (t == vec2(0.0)) {{
+        // 1:1 (or an exactly-integral sample): single-texel fetches,
+        // identical to the pre-scaling shader
+        y = fY(base.x, base.y);
+        uv = fC(floor(base.x * 0.5), floor(base.y * 0.5));
+    }} else {{
+        vec4 wx = cmr(t.x);
+        vec4 wy = cmr(t.y);
+        // 16-tap loop, upstream textureCatmullRom's shape: cache the
+        // inner 2x2 for anti-ringing, sigmoidize each tap (luma only -
+        // bilinear chroma has no negative lobes, nothing to ring)
+        float n00 = 0.0, n10 = 0.0, n01 = 0.0, n11 = 0.0;
+        y = 0.0;
+        for (int j = 0; j < 4; j++) {{
+            float r = base.y + float(j) - 1.0;
+            for (int i = 0; i < 4; i++) {{
+                float tap = fY(base.x + float(i) - 1.0, r);
+                if (i == 1 && j == 1) n00 = tap;
+                if (i == 2 && j == 1) n10 = tap;
+                if (i == 1 && j == 2) n01 = tap;
+                if (i == 2 && j == 2) n11 = tap;
+                y += sig_forward(tap) * wx[i] * wy[j];
+            }}
+        }}
+        y = sig_inverse(y);
+        // anti-ringing: pull overshoot back toward the inner
+        // neighborhood's range (same strength as the present upscaler)
+        float lo = min(min(n00, n10), min(n01, n11));
+        float hi = max(max(n00, n10), max(n01, n11));
+        y = mix(y, clamp(y, lo, hi), 0.8);
+        // chroma bilinear at MPEG-2 4:2:0 siting (left-cosited
+        // horizontally, midway vertically)
+        vec2 c = vec2(s.x * 0.5, s.y * 0.5 - 0.25);
+        vec2 cb = floor(c);
+        vec2 ct = c - cb;
+        uv = mix(mix(fC(cb.x,       cb.y), fC(cb.x + 1.0, cb.y), ct.x),
+                 mix(fC(cb.x, cb.y + 1.0), fC(cb.x + 1.0, cb.y + 1.0), ct.x),
+                 ct.y);
+    }}
+    y = (y{yoffset}){ymult};
+    highp float u = (uv.r - 0.5){umult};
+    highp float v = (uv.g - 0.5){vmult};
+
+    highp float r = y +           {e} * v;
+    highp float g = y + {f} * u + {g} * v;
+    highp float b = y + {d} * u;
+
+    frag_color = vec4(r, g, b, 1.0);
+}}
+"""
+
+
 def gen_AYUV_to_RGB(cs="bt601", full_range=True, fmt="AYUV") -> str:
     """Packed AYUV / XYUV -> RGB conversion.
     Memory order is V,U,Y,A-or-X, which maps to R,G,B,A in GL_RGBA8."""
@@ -393,6 +541,7 @@ SOURCE: dict[str, str] = {
 for full in (False, True):
     suffix = "_FULL" if full else ""
     SOURCE[f"NV12_to_RGB{suffix}"] = gen_NV12_to_RGB(full_range=full)
+    SOURCE[f"NV12_FIELDS_to_RGB{suffix}"] = gen_NV12_FIELDS_to_RGB(full_range=full)
     SOURCE[f"AYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="AYUV")
     SOURCE[f"XYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="XYUV")
     SOURCE[f"Y410_to_RGB{suffix}"] = gen_Y410_to_RGB(full_range=full)

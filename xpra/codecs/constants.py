@@ -280,7 +280,19 @@ class CodecSpec:
         return v
 
     def get_instance_count(self) -> int:
-        return len(get_instances(self.codec_class))
+        # closed instances may linger (deferred teardown while their
+        # decoded frames are still in the paint pipeline) - they no
+        # longer consume a codec slot, so don't count them
+        count = 0
+        for instance in tuple(get_instances(self.codec_class)):
+            is_closed = getattr(instance, "is_closed", None)
+            try:
+                if callable(is_closed) and is_closed():
+                    continue
+            except Exception:
+                pass
+            count += 1
+        return count
 
     def to_dict(self, *skip: str) -> dict[str, Any]:
         # note: no `asdict()` here - it deep-copies every value before we get

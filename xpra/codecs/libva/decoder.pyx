@@ -22,7 +22,7 @@ from xpra.log import Logger
 
 log = Logger("decoder", "libva")
 
-from libc.stdint cimport uint8_t, uintptr_t
+from libc.stdint cimport uint8_t, uint32_t, uintptr_t
 from xpra.buffers.membuf cimport buffer_context  # pylint: disable=syntax-error
 
 
@@ -62,6 +62,10 @@ cdef extern from "va_decode.h":
         int      us_sync
         int      us_map
         int      us_copy
+        uintptr_t vdp_device
+        void     *get_proc_address
+        uint32_t  vdp_surface
+        int       surface_index
 
     ctypedef void (*libva_log_fn)(const char *msg)
 
@@ -82,6 +86,9 @@ cdef extern from "va_decode.h":
                                            const uint8_t *data, int data_len,
                                            LibVADecodedFrame *frame) nogil
 
+    void              libva_decoder_release_surface(LibVADecoder *dec, int surface_index) nogil
+    int               libva_decoder_pinned_count(LibVADecoder *dec) nogil
+
     int               libva_decoder_get_width(LibVADecoder *dec)
     int               libva_decoder_get_height(LibVADecoder *dec)
     int               libva_decoder_get_last_status(LibVADecoder *dec)
@@ -96,6 +103,51 @@ COLORSPACES: dict[str, tuple[str, ...]] = {
     "vp8": ("YUV420P", ),
     "vp9": ("YUV420P", ),
 }
+
+
+class VDPAUSurfaceImage(ImageWrapper):
+    """GPU-resident decoded frame: carries the VDPAU interop triple for
+    GL_NV_vdpau_interop instead of CPU pixels - the paint code
+    recognises it via get_gpu_buffer() (same pattern as the other GPU
+    wrappers: CUDAImageWrapper, DXGIImageWrapper, DMABufImageWrapper).
+    Freeing (or GC) releases the pinned decoder surface slot."""
+
+    def __init__(self, decoder, surface_index: int,
+                 vdp_device: int, get_proc_address_ptr: int, vdp_surface: int,
+                 width: int, height: int, full_range: bool):
+        super().__init__(0, 0, width, height, None, "NV12", 24, width,
+                         1, ImageWrapper.PLANAR_2, True, None, full_range)
+        self.decoder = decoder
+        self.surface_index = surface_index
+        self.gpu_buffer = {
+            "type": "vdpau",
+            "device": vdp_device,
+            "get_proc_address": get_proc_address_ptr,
+            "surface": vdp_surface,
+        }
+
+    def get_gpu_buffer(self) -> dict:
+        # the base class returns None (= no GPU buffer): this dict is
+        # what routes the frame to the zero-copy paint path
+        return self.gpu_buffer
+
+    def get_pixels(self):
+        # the base class would silently return the empty pixels value
+        raise RuntimeError("VDPAUSurfaceImage has no CPU pixels (zero-copy frame)")
+
+    def free(self) -> None:
+        # release the pinned surface slot exactly once - this may also
+        # complete the decoder's deferred destroy
+        decoder = self.decoder
+        self.decoder = None
+        if decoder is not None:
+            decoder.release_surface(self.surface_index)
+        super().free()
+
+    def __repr__(self):
+        return "VDPAUSurfaceImage(%ux%u vdp_surface=%u slot=%i%s)" % (
+            self.width, self.height, self.gpu_buffer["surface"],
+            self.surface_index, " freed" if self.freed else "")
 
 
 def init_module(options: dict = None) -> None:
@@ -218,6 +270,7 @@ cdef class Decoder:
     cdef object encoding
     cdef int full_range
 
+    cdef bint closed
     cdef object __weakref__
 
     def init_context(self, encoding: str, int width, int height, colorspace: str, options: typedict) -> None:
@@ -261,28 +314,56 @@ cdef class Decoder:
             raise RuntimeError(msg)
 
     def __repr__(self):
-        if self.context == NULL:
+        if self.closed or self.context == NULL:
             return "libva_decoder(closed)"
         return "libva_decoder(%s:%ix%i:%s)" % (self.encoding, self.width, self.height, self.colorspace)
 
     def __dealloc__(self):
-        self.clean()
+        # the C context is destroyed HERE, when the last Python
+        # reference to this decoder drops: every consumer (in-flight
+        # VDPAUSurfaceImage via .decoder, the GL backing via its
+        # decoder attribute, the codec management) holds a strong
+        # reference, so plain CPython refcounting provides the
+        # deferred teardown that close-with-frames-in-flight needs.
+        # No Python calls in here (the object is partially destroyed,
+        # and collection can happen at interpreter finalization):
+        # libva_decoder_destroy is pure C.
+        if self.context != NULL:
+            with nogil:
+                libva_decoder_destroy(self.context)
+            self.context = NULL
 
     def clean(self) -> None:
-        cdef LibVADecoder *context = self.context
-        if context != NULL:
-            log("libva decoder close context %#x", <uintptr_t> context)
-            self.context = NULL
-            with nogil:
-                libva_decoder_destroy(context)
+        # only mark closed: is_closed() must flip immediately (the
+        # codec spec's instance-count gate and the painter's
+        # closing-decoder release both key on it), but the C context
+        # stays alive until __dealloc__ - zero-copy frames still in
+        # the paint pipeline and the GL backing keep referencing it
+        if not self.closed:
+            self.closed = True
+            log("libva decoder close context %#x", <uintptr_t> self.context)
         self.frames = 0
         self.width = 0
         self.height = 0
         self.colorspace = ""
         self.encoding = ""
 
+    def release_surface(self, surface_index: int) -> None:
+        # called from VDPAUSurfaceImage.free() - possibly on the UI
+        # thread; unpins the surface pool slot so decode may reuse it
+        cdef int idx = surface_index
+        if self.context != NULL:
+            with nogil:
+                libva_decoder_release_surface(self.context, idx)
+
     def is_closed(self) -> bool:
-        return self.context == NULL
+        return self.closed
+
+    def exported_pinned_count(self) -> int:
+        # frames exported zero-copy and not yet released by the painter
+        if self.context == NULL:
+            return 0
+        return libva_decoder_pinned_count(self.context)
 
     def get_encoding(self) -> str:
         return self.encoding
@@ -316,7 +397,7 @@ cdef class Decoder:
         cdef uint8_t *src
         cdef Py_ssize_t src_len
 
-        assert self.context != NULL, "decoder is closed"
+        assert self.context != NULL and not self.closed, "decoder is closed"
         start = monotonic()
         with buffer_context(data) as bc:
             src = <uint8_t*> (<uintptr_t> int(bc))
@@ -333,6 +414,30 @@ cdef class Decoder:
             # decoder state (DPB / reference chain)
             raise CodecStateException("libva decode error: %s (detail: %s, sts=%d)" % (
                 libva_decode_status_str(status).decode("latin-1"), detail, last_sts))
+        self.frames += 1
+        # va_decode.c parses the colour range from the bitstream headers for h264 (SPS VUI)
+        # and vp9 (color_config), but vp8 has no range syntax - so for vp8 we reuse the range
+        # from an earlier frame's options; the client option always takes precedence:
+        if "full-range" in options:
+            self.full_range = options.boolget("full-range")
+        elif self.encoding != "vp8":
+            self.full_range = bool(frame.full_range)
+
+        if frame.nplanes == 0:
+            # zero-copy GPU frame (h264 is export-only): the pixels
+            # never left the GPU - hand the painter the VDPAU interop
+            # triple (GL_NV_vdpau_interop)
+            elapsed = int((monotonic() - start) * 1000000)
+            log("libva decoded %s %8d bytes into %dx%d NV12 (zero-copy vdp_surface=%u) "
+                "in %dms submit=%dus sync=%dus",
+                self.encoding, src_len, frame.width, frame.height, frame.vdp_surface,
+                (elapsed + 500) // 1000, frame.us_submit, frame.us_sync)
+            return VDPAUSurfaceImage(self, frame.surface_index,
+                                     frame.vdp_device,
+                                     <uintptr_t> frame.get_proc_address,
+                                     frame.vdp_surface,
+                                     frame.width, frame.height,
+                                     bool(self.full_range))
 
         pixels = tuple(frame.planes[i][:frame.sizes[i]] for i in range(frame.nplanes))
         strides = tuple(frame.strides[i] for i in range(frame.nplanes))
@@ -346,14 +451,6 @@ cdef class Decoder:
         log("libva decoded %s %8d bytes into %dx%d %s in %dms submit=%dus sync=%dus map=%dus copy=%dus",
             self.encoding, src_len, frame.width, frame.height, pixel_format, (elapsed + 500) // 1000,
             frame.us_submit, frame.us_sync, frame.us_map, frame.us_copy)
-        self.frames += 1
-        # va_decode.c parses the colour range from the bitstream headers for h264 (SPS VUI)
-        # and vp9 (color_config), but vp8 has no range syntax - so for vp8 we reuse the range
-        # from an earlier frame's options; the client option always takes precedence:
-        if "full-range" in options:
-            self.full_range = options.boolget("full-range")
-        elif self.encoding != "vp8":
-            self.full_range = bool(frame.full_range)
         return ImageWrapper(0, 0, self.width, self.height,
                             pixels, pixel_format, frame.depth, strides,
                             frame.bytes_per_pixel, planes,

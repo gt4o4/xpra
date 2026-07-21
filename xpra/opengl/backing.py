@@ -58,8 +58,15 @@ from xpra.util.str_fn import repr_ellipsized, hexstr, csv
 from xpra.util.env import envint, envbool, first_time
 from xpra.util.objects import typedict
 from xpra.util.system import is_X11
-from xpra.common import roundup
+from xpra.common import roundup, noop
 from xpra.codecs.constants import get_subsampling_divs, get_plane_name
+import ctypes
+from OpenGL.GL.NV.vdpau_interop import (
+    glVDPAUInitNV, glVDPAUFiniNV,
+    glVDPAURegisterVideoSurfaceNV, glVDPAUSurfaceAccessNV,
+    glVDPAUUnregisterSurfaceNV, glVDPAUIsSurfaceNV,
+    glVDPAUMapSurfacesNV, glVDPAUUnmapSurfacesNV,
+)
 from xpra.client.gui.window_border import WindowBorder
 from xpra.client.gui.paint_colors import get_paint_box_color
 from xpra.client.gui.window.backing import fire_paint_callbacks, WindowBackingBase, WEBP_PILLOW, ALERT_MODE, \
@@ -275,6 +282,10 @@ class GLWindowBackingBase(WindowBackingBase):
         self.textures = []  # OpenGL texture IDs
         self.shaders: dict[str, GLuint] = {}
         self.programs: dict[str, GLuint] = {}
+        # GL_NV_vdpau_interop state (zero-copy VDPAU decode paint):
+        self.vdpau_device: int = 0
+        self.vdpau_decoder = None           # decoder whose device is pinned by this backing
+        self.vdpau_registrations: dict[int, tuple[int, tuple[int, ...]]] = {}
         self.texture_size: tuple[int, int] = (0, 0)
         self.gl_setup = False
         self.debug_setup = False
@@ -654,6 +665,13 @@ class GLWindowBackingBase(WindowBackingBase):
 
     def close_gl(self, context) -> None:
         log("close_gl(%s)", context)
+        # idle the pipeline before ANY teardown (nouveau's
+        # idle-before-free discipline, applied at the app layer)
+        try:
+            glFinish()
+        except GLError:
+            log("glFinish failed in close_gl", exc_info=True)
+        self.vdpau_release_device()
         self.free_cuda_context()
         try:
             from OpenGL.GL import glDeleteProgram, glDeleteShader
@@ -1565,6 +1583,14 @@ class GLWindowBackingBase(WindowBackingBase):
                        x: int, y: int, enc_width: int, enc_height: int, width: int, height: int,
                        options: typedict, callbacks: PaintCallbacks):
         log("do_video_paint%s", (coding, img, x, y, enc_width, enc_height, width, height, options, callbacks))
+        gpu = getattr(img, "get_gpu_buffer", noop)()
+        if isinstance(gpu, dict) and gpu.get("type") == "vdpau":
+            # zero-copy: the decoded frame is a VdpVideoSurface;
+            # composite it via GL_NV_vdpau_interop on the UI thread
+            encoding = options.strget("encoding")
+            self.with_gfx_context(self.paint_vdpau, encoding, img,
+                                  x, y, enc_width, enc_height, width, height, options, callbacks)
+            return
         if not zerocopy_upload or FORCE_CLONE:
             # copy so the data will be usable (usually a str)
             img.clone_pixel_data()
@@ -1730,6 +1756,204 @@ class GLWindowBackingBase(WindowBackingBase):
             glBindTexture(target, 0)
             glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
         # glActiveTexture(GL_TEXTURE0)    #redundant, we always call render_planar_update afterwards
+
+    def vdpau_interop_init(self, decoder, device: int, get_proc_address: int) -> bool:
+        # lazy per-backing GL_NV_vdpau_interop init; re-init on device
+        # change (a decoder restart re-opens the VA display = new
+        # VdpDevice: each decoder generation lives and dies on its OWN
+        # device, so creates land on empty devices and teardown bursts
+        # on dying ones - a persistent shared device was tried and
+        # RETIRED 2026-07-20: same-device generational churn injures the
+        # VP2 engine persistently, see the host notes).  Holding
+        # `self.vdpau_decoder` is what keeps the device alive: the
+        # decoder's C context (and with it the VdpDevice that GL
+        # registered surfaces against) is destroyed by Python object
+        # lifetime when the last reference drops - GL always lets go
+        # first (the register-on-dead-device path poisons the whole
+        # interop session with GL_OUT_OF_MEMORY).
+        if decoder is None:
+            # nothing would keep the VdpDevice alive - refuse
+            raise RuntimeError("no decoder reference for vdpau device %#x" % device)
+        if self.vdpau_device == device:
+            return True
+        self.vdpau_release_device()
+        glVDPAUInitNV(ctypes.c_void_p(device), ctypes.c_void_p(get_proc_address))
+        self.vdpau_device = device
+        self.vdpau_decoder = decoder
+        log("vdpau interop initialized for device %#x", device)
+        return True
+
+    def vdpau_release_device(self) -> None:
+        # full session teardown (window close, or a poisoned session on
+        # a paint error).  Quiesced order, nouveau's discipline: idle GL,
+        # unregister everything, FiniNV, idle again, THEN drop the
+        # decoder reference (which may finalize the decoder teardown via
+        # its deallocator)
+        decoder = self.vdpau_decoder
+        self.vdpau_decoder = None
+        if self.vdpau_device:
+            try:
+                glFinish()
+                self.vdpau_teardown_registrations()
+                glVDPAUFiniNV()
+                glFinish()
+            except GLError:
+                log("vdpau interop teardown failed", exc_info=True)
+            self.vdpau_device = 0
+        del decoder
+
+    def vdpau_teardown_registrations(self) -> None:
+        # must run with the GL context current; quiesced lifecycle:
+        # unregister everything in one batch (churn is the fault trigger
+        # on legacy NVIDIA - see the host notes)
+        regs = self.vdpau_registrations
+        self.vdpau_registrations = {}
+        if not regs:
+            return
+        for vdp_surface, (nv_handle, textures) in regs.items():
+            try:
+                if glVDPAUIsSurfaceNV(nv_handle):
+                    glVDPAUUnregisterSurfaceNV(nv_handle)
+            except GLError:
+                log("unregister %#x failed", nv_handle, exc_info=True)
+            glDeleteTextures(textures)
+        log("vdpau interop: %i registrations released", len(regs))
+
+    def vdpau_register(self, vdp_surface: int) -> tuple[int, tuple[int, ...]]:
+        # registration cache: the decoder's surface pool is small and
+        # stable (<=20 surfaces re-decoded in place), so each surface
+        # registers once per decoder lifetime, not per frame
+        reg = self.vdpau_registrations.get(vdp_surface)
+        if reg:
+            return reg
+        # a VdpVideoSurface maps to 4 field textures, GROUPED by plane
+        # (probed on nvidia-340: sizes WxH/2, WxH/2, W/2xH/4, W/2xH/4):
+        # 0=top-field luma, 1=bottom-field luma,
+        # 2=top-field chroma, 3=bottom-field chroma
+        textures = tuple(int(t) for t in glGenTextures(4))
+        arr = (ctypes.c_uint * 4)(*textures)
+        try:
+            nv_handle = glVDPAURegisterVideoSurfaceNV(
+                ctypes.c_void_p(vdp_surface), GL_TEXTURE_RECTANGLE, 4, arr)
+            from OpenGL.GL import GL_READ_ONLY as GL_RO
+            glVDPAUSurfaceAccessNV(nv_handle, GL_RO)
+        except GLError:
+            glDeleteTextures(textures)
+            raise
+        reg = (int(nv_handle), textures)
+        self.vdpau_registrations[vdp_surface] = reg
+        log("vdpau interop: registered surface %u -> handle %#x textures %s",
+            vdp_surface, nv_handle, textures)
+        return reg
+
+    def paint_vdpau(self, context, encoding: str, img,
+                    x: int, y: int, enc_width: int, enc_height: int, width: int, height: int,
+                    options: typedict, callbacks: PaintCallbacks) -> None:
+        # zero-copy paint of a VDPAUSurfaceImage (GL_NV_vdpau_interop):
+        # the decoded VdpVideoSurface is sampled directly by the
+        # NV12_FIELDS shader - no readback, no upload
+        if not context:
+            img.free()
+            fire_paint_callbacks(callbacks, False, "failed to get a gl context")
+            return
+        flush = options.intget("flush", 0)
+        x, y = self.gravity_adjust(x, y, options)
+        try:
+            self.gl_init(context)
+            gpu = img.get_gpu_buffer()
+            decoder = getattr(img, "decoder", None)
+            if decoder is None or img.freed:
+                raise RuntimeError(f"stale zero-copy frame: {img!r}")
+            self.vdpau_interop_init(decoder, gpu["device"], gpu["get_proc_address"])
+            nv_handle, textures = self.vdpau_register(gpu["surface"])
+            harr = (ctypes.c_ssize_t * 1)(nv_handle)
+            glVDPAUMapSurfacesNV(1, harr)
+            try:
+                shader = "NV12_FIELDS_to_RGB"
+                if img.get_full_range():
+                    shader += "_FULL"
+                self.render_vdpau_fields(textures, x, y, enc_width, enc_height, width, height, shader)
+            finally:
+                glVDPAUUnmapSurfacesNV(1, harr)
+            # if the decoder is closing and this was its last in-flight
+            # frame, let go of its device NOW (GL context is current):
+            # unregister + FiniNV first, then drop the reference - the
+            # decoder's deallocator performs the actual VDPAU teardown
+            try:
+                closing = decoder is not None and decoder.is_closed() \
+                    and decoder.exported_pinned_count() <= 1
+            except Exception:
+                closing = False
+            if closing and decoder is self.vdpau_decoder:
+                self.vdpau_release_device()
+                log("vdpau interop: released closing decoder %s", decoder)
+            img.free()
+            self.paint_box(encoding, x, y, width, height)
+            self.painted(context, x, y, width, height, flush)
+            fire_paint_callbacks(callbacks, True)
+            return
+        except Exception as e:
+            log.error("Error in vdpau interop paint", exc_info=True)
+            message = f"vdpau interop paint failed: {e}"
+            # reset the interop session - a failed register/map can
+            # poison it; a fresh InitNV on the next frame recovers
+            try:
+                self.vdpau_release_device()
+            except Exception:
+                log("vdpau interop reset failed", exc_info=True)
+        img.free()
+        fire_paint_callbacks(callbacks, False, message)
+
+    def render_vdpau_fields(self, textures: tuple[int, ...],
+                            rx: int, ry: int, rw: int, rh: int, width: int, height: int,
+                            shader="NV12_FIELDS_to_RGB") -> None:
+        # modeled on render_planar_update, but sampling the 4 interop
+        # field textures (uniforms Y0,C0,Y1,C1)
+        target = GL_TEXTURE_RECTANGLE
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.offscreen_fbo)
+        glBindTexture(target, self.textures[TEX_FBO])
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[TEX_FBO], 0)
+        glDrawBuffer(GL_COLOR_ATTACHMENT0)
+        w, h = self.size
+        viewport = (min(w, max(0, rx)), min(h, max(0, h - ry - height)),
+                    min(w, max(0, width)), min(h, max(0, height)))
+        glViewport(*viewport)
+        program = self.programs.get(shader)
+        if not program:
+            raise RuntimeError(f"no {shader} found!")
+        glUseProgram(program)
+        units = (GL_TEXTURE0, GL_TEXTURE1, GL_TEXTURE2, GL_TEXTURE3)
+        # interop texture order (probed on nvidia-340: sizes 2x WxH/2
+        # then 2x W/2xH/4): top-field luma, bottom-field luma,
+        # top-field chroma, bottom-field chroma
+        names = ("Y0", "Y1", "C0", "C1")
+        for i, (unit, name) in enumerate(zip(units, names)):
+            glActiveTexture(unit)
+            glBindTexture(target, textures[i])
+            glTexParameteri(target, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+            glTexParameteri(target, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+            tex_loc = glGetUniformLocation(program, name)
+            glUniform1i(tex_loc, i)
+        position = 0
+        viewport_pos = glGetUniformLocation(program, "viewport_pos")
+        glUniform2f(viewport_pos, rx, ry)
+        scaling = glGetUniformLocation(program, "scaling")
+        glUniform2f(scaling, width / rw, height / rh)
+        # video dimensions: the shader's interpolation taps clamp VIDEO
+        # rows before the field split (a post-split clamp would land in
+        # the wrong field texture)
+        vid_size = glGetUniformLocation(program, "vid_size")
+        glUniform2f(vid_size, rw, rh)
+        pos_buffer = self.set_vao(position)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glDeleteBuffers(1, [pos_buffer])
+        glDisableVertexAttribArray(position)
+        glBindVertexArray(0)
+        glUseProgram(0)
+        for unit in units:
+            glActiveTexture(unit)
+            glBindTexture(target, 0)
+        glActiveTexture(GL_TEXTURE0)
 
     def render_planar_update(self, rx: int, ry: int, rw: int, rh: int, width: int, height: int,
                              shader="YUV420P_to_RGB") -> None:
