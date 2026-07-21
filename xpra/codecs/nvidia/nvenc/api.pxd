@@ -781,6 +781,7 @@ cdef extern from "nvEncodeAPI.h":
         uint32_t    version             #[in]: Struct version. Must be set to ::NV_ENC_INITIALIZE_PARAMS_VER.
         GUID        encodeGUID          #[in]: Specifies the Encode GUID for which the encoder is being created. ::NvEncInitializeEncoder() API will fail if this is not set, or set to unsupported value.
         GUID        presetGUID          #[in]: Specifies the preset for encoding. If the preset GUID is set then , the preset configuration will be applied before any other parameter.
+        NV_ENC_TUNING_INFO tuningInfo   #[in]: tuning profile; UNDEFINED is rejected by drivers >= 591
         uint32_t    encodeWidth         #[in]: Specifies the encode width. If not set ::NvEncInitializeEncoder() API will fail.
         uint32_t    encodeHeight        #[in]: Specifies the encode height. If not set ::NvEncInitializeEncoder() API will fail.
         uint32_t    darWidth            #[in]: Specifies the display aspect ratio Width.
