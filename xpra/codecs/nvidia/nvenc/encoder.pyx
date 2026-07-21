@@ -862,6 +862,10 @@ cdef class Encoder:
         params.version = NV_ENC_INITIALIZE_PARAMS_VER
         params.encodeGUID = codec
         params.presetGUID = preset
+        # drivers >= 591.44 reject NvEncInitializeEncoder with P-presets
+        # and tuningInfo left UNDEFINED ("worked before was a bug" -
+        # NVIDIA); use the same tuning the preset config was fetched with
+        params.tuningInfo = self.get_tuning()
         params.encodeWidth = self.encoder_width
         params.encodeHeight = self.encoder_height
         params.maxEncodeWidth = self.encoder_width
@@ -975,10 +979,21 @@ cdef class Encoder:
         vui.videoSignalTypePresentFlag = 1          # videoFormat, videoFullRangeFlag and colourDescriptionPresentFlag are present
         vui.videoFormat = 0                         # 0=Component
         vui.videoFullRangeFlag = self.full_range
-        vui.colourDescriptionPresentFlag = 0
-        #vui.colourPrimaries = 1   #AVCOL_PRI_BT709 ?
-        #vui.transferCharacteristics = 1   #AVCOL_TRC_BT709 ?
-        #vui.colourMatrix = 5    #AVCOL_SPC_BT470BG  - switch to AVCOL_SPC_BT709?
+        # declare what the CUDA CSC kernels actually produce
+        # (H.273 code points): BT.601 matrix on sRGB-primaries input
+        # with sRGB transfer; without this the matrix is left
+        # "unspecified" and clients guessing BT.709 for HD sizes
+        # mis-convert every colour
+        vui.colourDescriptionPresentFlag = 1
+        vui.colourPrimaries = 1                     # BT.709/sRGB primaries
+        vui.transferCharacteristics = 13            # sRGB
+        vui.colourMatrix = 6                        # BT.601 / SMPTE 170M
+        # chroma siting: type 0 (MPEG-2: co-sited horizontally,
+        # centered vertically) - what the kernels emit and what
+        # siting-aware scalers assume
+        vui.chromaSampleLocationFlag = 1
+        vui.chromaSampleLocationTop = 0
+        vui.chromaSampleLocationBot = 0
 
     cdef void tune_hevc(self, NV_ENC_CONFIG_HEVC *hevc, int gopLength):
         hevc.chromaFormatIDC = self.get_chroma_format()
@@ -992,10 +1007,15 @@ cdef class Encoder:
         vui.videoSignalTypePresentFlag = 1          # videoFormat, videoFullRangeFlag and colourDescriptionPresentFlag are present
         vui.videoFormat = 0                         # 0=Component
         vui.videoFullRangeFlag = self.full_range
-        vui.colourDescriptionPresentFlag = 0
-        #vui.colourPrimaries = 1
-        #vui.transferCharacteristics = 1
-        #vui.colourMatrix = 5
+        # same declaration as tune_h264: the CUDA CSC kernels produce
+        # full-range BT.601 from sRGB input, type-0 chroma siting
+        vui.colourDescriptionPresentFlag = 1
+        vui.colourPrimaries = 1
+        vui.transferCharacteristics = 13
+        vui.colourMatrix = 6
+        vui.chromaSampleLocationFlag = 1
+        vui.chromaSampleLocationTop = 0
+        vui.chromaSampleLocationBot = 0
 
     cdef void tune_av1(self, NV_ENC_CONFIG_AV1 *av1, int gopLength):
         memset(av1, 0, sizeof(NV_ENC_CONFIG_AV1))
@@ -1551,23 +1571,31 @@ cdef class Encoder:
         #a grid is a group of blocks: (gridw * gridh) blocks
         cdef uint32_t blockw = 32
         cdef uint32_t blockh = 32
-        cdef uint32_t gridw = MAX(1, w//(blockw*dx))
-        cdef uint32_t gridh = MAX(1, h//(blockh*dy))
-        #if dx or dy made us round down, add one:
-        if gridw*dx*blockw<w:
-            gridw += 1
-        if gridh*dy*blockh<h:
-            gridh += 1
-        cdef unsigned int in_w = self.input_width
-        cdef unsigned int in_h = self.input_height
+        # the grid covers the OUTPUT (padded coded frame): the kernel
+        # GATHERS from the source and writes every coded pixel
+        # ("scale into the padding" - content fills the 32-alignment
+        # padding rather than wasting coded bits on dead rows)
+        cdef uint32_t gridw = MAX(1, (self.encoder_width + blockw*dx - 1)//(blockw*dx))
+        cdef uint32_t gridh = MAX(1, (self.encoder_height + blockh*dy - 1)//(blockh*dy))
+        # source valid dims are always the true image dims; the last
+        # two kernel arguments are the CONTENT dims within the padded
+        # coded frame: when scaling, content fills the whole padded
+        # frame ("scale into the padding" - and scaled_size reports
+        # the padded size to the client, so its crop matches); when
+        # NOT scaling, content stays 1:1 at the true size and the
+        # kernel edge-extends the padding (the client crops exactly
+        # the 1:1 region, having received no scaled_size)
+        cdef unsigned int in_w = w
+        cdef unsigned int in_h = h
+        cdef unsigned int content_w = w
+        cdef unsigned int content_h = h
         if self.scaling:
-            #scaling so scale exact dimensions, not padded input dimensions:
-            in_w, in_h = w, h
+            content_w, content_h = self.encoder_width, self.encoder_height
 
         cdef double start = monotonic()
         args = (self.cudaInputBuffer, numpy.int32(in_w), numpy.int32(in_h), numpy.int32(stride),
                self.cudaOutputBuffer, numpy.int32(self.encoder_width), numpy.int32(self.encoder_height), numpy.int32(self.outputPitch),
-               numpy.int32(w), numpy.int32(h))
+               numpy.int32(content_w), numpy.int32(content_h))
         if DEBUG_API:
             def lf(v):
                 if isinstance(v, driver.DeviceAllocation):
