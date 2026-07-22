@@ -2284,6 +2284,14 @@ class WindowSource(WindowIconSource):
             return
         # queue packet for sending:
         self.queue_damage_packet(packet, damage_time, process_damage_time)
+        # and track its lossy state so the auto-refresh timer can
+        # follow up with a lossless still once the window goes quiet
+        # (this call went missing in a refactor, leaving the whole
+        # auto-refresh machinery below dormant: a scaled or lossy
+        # video region would stay blurry forever unless some OTHER
+        # event - a quality ramp, the video region clearing on later
+        # damage - happened to repaint it)
+        self.schedule_auto_refresh(packet, options)
 
     def schedule_auto_refresh(self, packet: Packet, options: typedict) -> None:
         if not self.can_refresh():

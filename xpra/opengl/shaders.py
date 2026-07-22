@@ -453,12 +453,47 @@ void main() {{
 }}
 """
 
+
+# Raster a BGRX image straight out of a buffer texture (a decoder-filled
+# PBO bound via glTexBuffer) into the draw framebuffer - the linear
+# bytes never become a 2D texture, so the one linear->tiled conversion
+# happens at raster time instead of an upload copy followed by a blit.
+# Addressing is explicit (row-major, tight rows of img_w texels), which
+# also performs the y-orientation and BGRX->RGB swizzle in the fetch.
+# jpega: the packed one-byte-per-pixel alpha plane sits in the SAME
+# buffer right after the BGRX pixels, so the RGBA8 view exposes alpha
+# for pixel `off` as texel awh + off/4, component off%4 (awh = w*h,
+# the alpha plane's base texel index; 0 = no alpha plane).
+BGRX_BUFFER_SHADER = f"""
+#version {GLSL_VERSION}
+layout(origin_upper_left) in vec4 gl_FragCoord;
+uniform vec2 viewport_pos;
+uniform samplerBuffer img;
+uniform int img_w;
+uniform int awh;
+layout(location = 0) out vec4 frag_color;
+
+void main()
+{{
+    ivec2 p = ivec2(gl_FragCoord.xy - viewport_pos.xy);
+    int off = p.y * img_w + p.x;
+    vec4 t = texelFetch(img, off);
+    float a = 1.0;
+    if (awh != 0) {{
+        vec4 a4 = texelFetch(img, awh + (off >> 2));
+        a = a4[off & 3];
+    }}
+    frag_color = vec4(t.bgr, a);
+}}
+"""
+
 SOURCE: dict[str, str] = {
     "blend": BLEND_SHADER,
     "vertex": VERTEX_SHADER,
     "overlay": OVERLAY_SHADER,
     "fixed-color": FIXED_COLOR_SHADER,
     "upscale": UPSCALE_SHADER,
+    "bgrx-buffer": BGRX_BUFFER_SHADER,
 }
 
 for full in (False, True):

@@ -46,6 +46,7 @@ from OpenGL.GL import (
     glEnableVertexAttribArray, glVertexAttribPointer, glDisableVertexAttribArray,
     glGenVertexArrays, glBindVertexArray, glDeleteVertexArrays,
     glUseProgram, GL_TEXTURE_RECTANGLE, glGetUniformLocation, glUniform1i, glUniform1f, glUniform2f, glUniform4f,
+    GL_TEXTURE_BUFFER, glTexBuffer,
 )
 from OpenGL.GL.ARB.framebuffer_object import (
     GL_FRAMEBUFFER, GL_DRAW_FRAMEBUFFER, GL_READ_FRAMEBUFFER,
@@ -282,6 +283,8 @@ class GLWindowBackingBase(WindowBackingBase):
         self.textures = []  # OpenGL texture IDs
         self.shaders: dict[str, GLuint] = {}
         self.programs: dict[str, GLuint] = {}
+        # buffer-texture name for the gpujpeg paint path (lazy):
+        self.tbo_texture = 0
         # GL_NV_vdpau_interop state (zero-copy VDPAU decode paint):
         self.vdpau_device: int = 0
         self.vdpau_decoder = None           # decoder whose device is pinned by this backing
@@ -487,7 +490,7 @@ class GLWindowBackingBase(WindowBackingBase):
         vertex_shader = self.init_shader("vertex", GL_VERTEX_SHADER)
         from xpra.opengl.shaders import SOURCE
         for name, source in SOURCE.items():
-            if name in ("overlay", "blend", "vertex", "fixed-color", "upscale"):
+            if name in ("overlay", "blend", "vertex", "fixed-color", "upscale", "bgrx-buffer"):
                 continue
             fragment_shader = self.init_shader(name, GL_FRAGMENT_SHADER)
             self.init_program(name, vertex_shader, fragment_shader)
@@ -503,6 +506,13 @@ class GLWindowBackingBase(WindowBackingBase):
             self.init_program("upscale", vertex_shader, upscale_shader)
         except RuntimeError:
             log.warn("Warning: upscale shader failed to compile, using bilinear scaling")
+        # the gpujpeg paint path (needs buffer textures, GL 3.1+) -
+        # without it, gpujpeg paints fall back to host decoding:
+        try:
+            tbo_shader = self.init_shader("bgrx-buffer", GL_FRAGMENT_SHADER)
+            self.init_program("bgrx-buffer", vertex_shader, tbo_shader)
+        except RuntimeError:
+            log.warn("Warning: bgrx-buffer shader failed to compile, gpujpeg will decode to host memory")
 
     def set_vao(self, index=0):
         vertices = [-1, -1, 1, -1, -1, 1, 1, 1]
@@ -712,6 +722,9 @@ class GLWindowBackingBase(WindowBackingBase):
             if len(textures) > 0:
                 self.textures = []
                 glDeleteTextures(textures)
+            if self.tbo_texture:
+                glDeleteTextures([self.tbo_texture])
+                self.tbo_texture = 0
         except Exception as e:
             log(f"{self}.close()", exc_info=True)
             log.error("Error closing OpenGL backing, some resources have not been freed")
@@ -1338,6 +1351,25 @@ class GLWindowBackingBase(WindowBackingBase):
     def do_paint_jpeg(self, encoding, img_data, x: int, y: int, width: int, height: int,
                       options: typedict, callbacks: PaintCallbacks) -> None:
         if width >= 16 and height >= 16:
+            # zero-copy path: the decoder writes its BGRX output
+            # DIRECTLY into a CUDA-mapped pixel-unpack PBO under the
+            # GL context - no intermediate buffer, no host bytes, no
+            # copies.  jpega decodes its grayscale alpha plane into a
+            # second PBO and the paint shader merges the two in the
+            # fetch, so the whole jpega decode is GPU-side too.  The
+            # decode runs on the UI thread like paint_nvjpeg's -
+            # acceptable at refresh rates, and any failure falls back
+            # to the host path.
+            if self.gpujpeg_decoder and encoding in ("jpeg", "jpega"):
+                def paint_gpujpeg(gl_context) -> None:
+                    self.paint_gpujpeg(gl_context, encoding, img_data, x, y, width, height,
+                                       options, callbacks)
+                self.with_gfx_context(paint_gpujpeg)
+                return
+            img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+            if img is not None:
+                self.paint_image_wrapper(encoding, img, x, y, width, height, options, callbacks)
+                return
             if self.nvjpeg_decoder and NVJPEG:
                 def paint_nvjpeg(gl_context) -> None:
                     self.paint_nvjpeg(gl_context, encoding, img_data, x, y, width, height, options, callbacks)
@@ -1355,6 +1387,95 @@ class GLWindowBackingBase(WindowBackingBase):
         else:
             img = self.jpeg_decoder.decompress_to_rgb(img_data, options)
         self.paint_image_wrapper(encoding, img, x, y, width, height, options, callbacks)
+
+    def paint_gpujpeg(self, gl_context, encoding: str, img_data, x: int, y: int,
+                      width: int, height: int,
+                      options: typedict, callbacks: PaintCallbacks) -> None:
+        # the decoder writes BGRX straight into a CUDA-mapped PBO
+        # (decode_into_gl_buffer: register/map/decode/unmap in one
+        # call), then draw_pbo_bgrx rasters the linear bytes straight
+        # into the offscreen FBO through a buffer texture.  jpega
+        # decodes its grayscale alpha plane into a SECOND pbo and the
+        # paint shader merges the two in the fetch - the whole jpega
+        # decode is GPU-side.
+        self.gl_init(gl_context)
+        if "bgrx-buffer" not in self.programs:
+            # no buffer-texture support (GL < 3.1): host decode
+            img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+            if img is None:
+                raise RuntimeError(f"gpujpeg host decode failed for {encoding}")
+            self.do_paint_image_wrapper(gl_context, encoding, img, x, y,
+                                        width, height, options, callbacks)
+            return
+        alpha_offset = options.intget("alpha-offset", 0)
+        # jpega appends the packed 1-byte-per-pixel alpha plane to the
+        # same buffer, right after the BGRX pixels:
+        size = width * height * (5 if alpha_offset else 4)
+        pbo = glGenBuffers(1)
+        try:
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo)
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, size, None, GL_STREAM_DRAW)
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+            try:
+                if alpha_offset:
+                    self.gpujpeg_decoder.decode_jpega_into_gl_buffer(img_data, alpha_offset,
+                                                                     int(pbo), width, height)
+                else:
+                    self.gpujpeg_decoder.decode_into_gl_buffer("BGRX", img_data, options,
+                                                               int(pbo), width, height)
+            except (RuntimeError, ValueError) as e:
+                log(f"gpujpeg zero-copy decode failed: {e} - using the host path")
+                img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+                if img is not None:
+                    self.do_paint_image_wrapper(gl_context, encoding, img, x, y,
+                                                width, height, options, callbacks)
+                    return
+                raise
+
+            self.draw_pbo_bgrx(pbo, x, y, width, height, bool(alpha_offset))
+        finally:
+            # the draw has queued its reads of the pbo by now, so the
+            # deferred GL delete is ordered correctly after them
+            glDeleteBuffers(1, [pbo])
+
+        self.paint_box(encoding, x, y, width, height)
+        self.painted(gl_context, x, y, width, height, options.intget("flush", 0))
+        fire_paint_callbacks(callbacks)
+
+    def draw_pbo_bgrx(self, pbo, x: int, y: int, w: int, h: int, with_alpha=False) -> None:
+        # bind the decoder-filled PBO as a buffer texture and raster it
+        # straight into the offscreen FBO: the one linear->tiled
+        # conversion happens at raster time, instead of a swizzling
+        # upload copy into TEX_RGB followed by a blit - half the memory
+        # traffic, and no staging texture at all.  Buffer textures
+        # cannot filter or attach, but this path needs neither: the
+        # shader texelFetches with explicit row-major addressing
+        # (which also does the y-orientation and BGRX swizzle).
+        # jpega (with_alpha): the packed alpha plane sits in the SAME
+        # buffer at byte offset w*h*4; the shader reads it through the
+        # same RGBA8 view at base texel `awh` = w*h.
+        if not self.tbo_texture:
+            self.tbo_texture = glGenTextures(1)
+        self.draw_to_offscreen()
+        bh = self.size[1]
+        with TemporaryViewport(x, bh - y - h, w, h):
+            program = self.programs["bgrx-buffer"]
+            glUseProgram(program)
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_BUFFER, self.tbo_texture)
+            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, pbo)
+            glUniform1i(glGetUniformLocation(program, "img"), 0)
+            glUniform1i(glGetUniformLocation(program, "awh"), w * h if with_alpha else 0)
+            glUniform1i(glGetUniformLocation(program, "img_w"), w)
+            glUniform2f(glGetUniformLocation(program, "viewport_pos"), x, y)
+            pos_buffer = self.set_vao(0)
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+            glBindVertexArray(0)
+            glUseProgram(0)
+            glDeleteBuffers(1, [pos_buffer])
+            # detach the pbo before the caller deletes it:
+            glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA8, 0)
+            glBindTexture(GL_TEXTURE_BUFFER, 0)
 
     def cuda_buffer_to_pbo(self, gl_context, cuda_buffer, rowstride: int, src_y: int, height: int, stream):
         # must be called with an active cuda context, and from the UI thread

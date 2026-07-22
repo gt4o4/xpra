@@ -481,6 +481,9 @@ webp_encoder_ENABLED    = webp_ENABLED
 webp_decoder_ENABLED    = webp_ENABLED
 jpeg_encoder_ENABLED    = DEFAULT and pkg_config_version("1.2", "libturbojpeg")
 jpeg_decoder_ENABLED    = DEFAULT and pkg_config_version("1.4", "libturbojpeg")
+# CUDA JPEG decoder (CESNET libgpujpeg) - independent of the nvidia
+# python helpers, the pyx links cudart + libgpujpeg directly:
+gpujpeg_decoder_ENABLED = DEFAULT and pkg_config_exists("libgpujpeg")
 avif_ENABLED            = DEFAULT and pkg_config_version("0.9", "libavif")
 avif_encoder_ENABLED    = avif_ENABLED
 avif_decoder_ENABLED    = avif_ENABLED
@@ -571,7 +574,7 @@ DECODER_SWITCHES = [
     "libva_decoder",
     "de265_decoder",
     "vpx_decoder", "webp_decoder", "pillow_decoder",
-    "jpeg_decoder", "avif_decoder", "jph_decoder",
+    "jpeg_decoder", "gpujpeg_decoder", "avif_decoder", "jph_decoder",
 ]
 CODEC_SWITCHES = ENCODER_SWITCHES + DECODER_SWITCHES + [
     "cuda_kernels", "cuda_rebuild",
@@ -3633,6 +3636,8 @@ tace(nvjpeg_decoder_ENABLED, "xpra.codecs.nvidia.nvjpeg.decoder",f"{cuda},nvjpeg
 toggle_packages(jpeg_decoder_ENABLED or jpeg_encoder_ENABLED, "xpra.codecs.jpeg")
 tace(jpeg_encoder_ENABLED, "xpra.codecs.jpeg.encoder", "libturbojpeg")
 tace(jpeg_decoder_ENABLED, "xpra.codecs.jpeg.decoder", "libturbojpeg")
+toggle_packages(gpujpeg_decoder_ENABLED, "xpra.codecs.gpujpeg")
+tace(gpujpeg_decoder_ENABLED, "xpra.codecs.gpujpeg.decoder", "libgpujpeg")
 toggle_packages(avif_ENABLED, "xpra.codecs.avif")
 tace(avif_encoder_ENABLED, "xpra.codecs.avif.encoder", "libavif")
 tace(avif_decoder_ENABLED, "xpra.codecs.avif.decoder", "libavif")
