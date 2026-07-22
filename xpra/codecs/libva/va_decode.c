@@ -660,8 +660,16 @@ static LibVADecodeStatus alloc_surfaces_and_context(LibVADecoder *dec) {
                               (unsigned int)dec->surface_height,
                               dec->surfaces, (unsigned int)dec->num_surfaces,
                               surface_attrs, 2);
-    if (status != VA_STATUS_SUCCESS)
+    if (status != VA_STATUS_SUCCESS) {
+        /* VA-API leaves the output array UNDEFINED on failure, and the
+         * VDPAU bridge (pre-fix) left the ids of partially-created,
+         * already-destroyed surfaces in it - our teardown would then
+         * re-destroy them (the vdpau_DestroySurfaces assert = SIGABRT
+         * under VRAM pressure).  Never trust the array on error. */
+        for (int i = 0; i < H264_NUM_SURFACES; i++)
+            dec->surfaces[i] = VA_INVALID_SURFACE;
         return set_error(dec, status, "vaCreateSurfaces");
+    }
     status = vaCreateContext(dec->display, dec->config,
                              dec->surface_width, dec->surface_height,
                              VA_PROGRESSIVE, dec->surfaces, dec->num_surfaces,

@@ -254,9 +254,10 @@ def get_specs() -> Sequence[VideoSpec]:
                 # VDPAU bridge (NVIDIA VP2 era) two concurrent decode
                 # streams corrupt each other's luma via the shared video
                 # engine's per-channel state (measured: whole-frame Y
-                # damage on 13-41% of frames, chroma bit-exact).  The
-                # selection layer routes additional streams to the next
-                # decoder (ie: openh264) while one is live.  The env
+                # damage on 13-41% of frames, chroma bit-exact - which
+                # turned out to be the 16-vs-32 surface alignment OOB
+                # write, fixed).  The selection layer routes additional
+                # streams to the next decoder (ie: openh264) while one
                 # is live when a finite cap is set.
                 max_instances=MAX_INSTANCES,
                 min_w=64, min_h=64,
