@@ -29,7 +29,7 @@ lock = Lock()
 # do not require the libraries to be installed
 NOWARN = [
     "nvenc", "nvdec", "enc_nvjpeg",
-    "dec_nvjpeg", "nvfbc", "dec_openh264",
+    "dec_nvjpeg", "dec_gpujpeg", "nvfbc", "dec_openh264",
     "csc_cython",
     "filter_torch",
     "filter_pillow",
@@ -82,7 +82,7 @@ ENCODER_VIDEO_CODECS: Sequence[str] = gfilt(autoprefix("enc", x) for x in (
     "vpx", "x264", "openh264", "nvenc", "vpl", "libva", "amf", "vt", "remote",
 ))
 DECODER_CODECS: Sequence[str] = gfilt(f"dec_{x}" for x in (
-    "pillow", "webp", "jpeg", "nvjpeg", "avif", "jph",
+    "pillow", "webp", "jpeg", "gpujpeg", "nvjpeg", "avif", "jph",
 ))
 DECODER_VIDEO_CODECS: Sequence[str] = gfilt(autoprefix("dec", x) for x in (
     "vpl", "mf", "nvdec", "libva", "vpx", "openh264", "dav1d", "aom", "de265",
@@ -279,6 +279,7 @@ CODEC_OPTIONS: dict[str, tuple[str, str, str, str]] = {
     "dec_pillow"    : ("Pillow decoder",    "pillow",       "decoder", "decompress"),
     "dec_webp"      : ("webp decoder",      "webp",         "decoder", "decompress_to_rgb,decompress_to_yuv"),
     "dec_jpeg"      : ("JPEG decoder",      "jpeg",         "decoder", "decompress_to_rgb,decompress_to_yuv"),
+    "dec_gpujpeg"   : ("GPU JPEG decoder",  "gpujpeg",      "decoder", "decompress"),
     "dec_avif"      : ("avif decoder",      "avif",         "decoder", "decompress"),
     "dec_jph"       : ("JPH decoder",       "jph",          "decoder", "decompress"),
     "dec_nvjpeg"    : ("nvjpeg decoder",    "nvidia.nvjpeg", "decoder", "decompress"),

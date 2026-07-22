@@ -28,6 +28,7 @@ log = Logger("client", "encoding")
 
 CODEC_LOAD_TIMEOUT = envint("XPRA_CODEC_LOAD_TIMEOUT", 30)
 B_FRAMES = envbool("XPRA_B_FRAMES", True)
+AUTO_REFRESH_ENCODINGS = tuple(x.strip() for x in os.environ.get("XPRA_AUTO_REFRESH_ENCODINGS", "").split(",") if x.strip())
 PAINT_FLUSH = envbool("XPRA_PAINT_FLUSH", True)
 MAX_SOFT_EXPIRED = envint("XPRA_MAX_SOFT_EXPIRED", 5)
 SEND_TIMESTAMPS = envbool("XPRA_SEND_TIMESTAMPS", False)
@@ -47,7 +48,7 @@ def get_core_encodings() -> Sequence[str]:
     """
     # we always support rgb:
     core_encodings = ["rgb24", "rgb32"]
-    for codec in ("dec_pillow", "dec_webp", "dec_jpeg", "dec_nvjpeg", "dec_avif", "dec_jph"):
+    for codec in ("dec_pillow", "dec_webp", "dec_jpeg", "dec_gpujpeg", "dec_nvjpeg", "dec_avif", "dec_jph"):
         if has_codec(codec):
             c = get_codec(codec)
             encs = c.get_encodings()
@@ -220,6 +221,7 @@ class Encodings(StubClientSubsystem):
             # try to load the fast jpeg decoders:
             load_codec("dec_jpeg")
             if allow_hardware_jpeg:
+                load_codec("dec_gpujpeg")
                 load_codec("dec_nvjpeg")
                 load_codec("nvdec")
         if "webp" in ae:
@@ -328,6 +330,14 @@ class Encodings(StubClientSubsystem):
             "send-timestamps": SEND_TIMESTAMPS,
             "eos": True,
         }
+        if AUTO_REFRESH_ENCODINGS:
+            # constrain which encodings the server may use for the
+            # lossless auto-refresh (the server-side handling of this
+            # capability has always existed - see client_refresh_encodings
+            # in the window source - but no client ever sent it): e.g. a
+            # client with a hardware jpeg decoder prefers jpeg refreshes
+            # over webp
+            caps["auto_refresh_encodings"] = AUTO_REFRESH_ENCODINGS
         if self.video_scaling is not None:
             caps["scaling.control"] = self.video_scaling
         if self.encoding:

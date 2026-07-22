@@ -213,6 +213,7 @@ class WindowBackingBase:
         self.avif_decoder = get_codec("dec_avif")
         self.jph_decoder = get_codec("dec_jph")
         self.nvjpeg_decoder = get_codec("dec_nvjpeg")
+        self.gpujpeg_decoder = get_codec("dec_gpujpeg")
         self.nvdec_decoder = get_codec("nvdec")
         self.cuda_context = None
         self.draw_needs_refresh: bool = True
@@ -569,9 +570,28 @@ class WindowBackingBase:
             log.warn(f" {e}")
             return None
 
+    def gpujpeg_decode(self, encoding: str, img_data, width: int, height: int,
+                       options: typedict) -> ImageWrapper | None:
+        # decode on the GPU via libgpujpeg (BGRX host output; BGRA
+        # for "jpega" - the alpha plane is a second grayscale jpeg,
+        # also GPU-decoded, merged into the 4th channel);
+        # any failure falls through to the other decoders - oversize
+        # inputs are an expected, non-fatal refusal
+        gpujpeg = self.gpujpeg_decoder
+        if not gpujpeg or encoding not in ("jpeg", "jpega") or width < 16 or height < 16:
+            return None
+        rgb_format = "BGRA" if encoding == "jpega" else "BGRX"
+        try:
+            return gpujpeg.decompress(rgb_format, img_data, options)
+        except (RuntimeError, ValueError) as e:
+            log(f"gpujpeg decode failed: {e} - using another decoder")
+            return None
+
     def do_paint_jpeg(self, encoding: str, img_data, x: int, y: int, width: int, height: int,
                       options: typedict, callbacks: PaintCallbacks) -> None:
-        img = self.nv_decode(encoding, img_data, width, height, options)
+        img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+        if img is None:
+            img = self.nv_decode(encoding, img_data, width, height, options)
         if img is None:
             assert self.jpeg_decoder is not None
             img = self.jpeg_decoder.decompress_to_rgb(img_data, options)

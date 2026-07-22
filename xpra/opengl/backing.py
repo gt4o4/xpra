@@ -103,6 +103,7 @@ FBO_RESIZE_DELAY = envint("XPRA_OPENGL_FBO_RESIZE_DELAY", -1)
 RESIZE_GLFINISH = envbool("XPRA_OPENGL_RESIZE_GLFINISH", True)
 CONTEXT_REINIT = envbool("XPRA_OPENGL_CONTEXT_REINIT", False)
 NVJPEG = envbool("XPRA_OPENGL_NVJPEG", True)
+GPUJPEG_ZEROCOPY = envbool("XPRA_GPUJPEG_ZEROCOPY", True)
 NVDEC = envbool("XPRA_OPENGL_NVDEC", False)
 ALWAYS_RGBA = envbool("XPRA_OPENGL_ALWAYS_RGBA", False)
 SHOW_PLANE_RANGES = envbool("XPRA_SHOW_PLANE_RANGES", False)
@@ -1342,6 +1343,23 @@ class GLWindowBackingBase(WindowBackingBase):
     def do_paint_jpeg(self, encoding, img_data, x: int, y: int, width: int, height: int,
                       options: typedict, callbacks: PaintCallbacks) -> None:
         if width >= 16 and height >= 16:
+            # zero-copy path for plain jpeg: the decoder writes its
+            # BGRX output DIRECTLY into a CUDA-mapped pixel-unpack
+            # PBO under the GL context - no intermediate buffer, no
+            # host bytes, no copies (jpega keeps the host path: its
+            # alpha merge is CPU-side).  The decode runs on the UI
+            # thread like paint_nvjpeg's - acceptable at refresh
+            # rates, and any failure falls back to the host path.
+            if GPUJPEG_ZEROCOPY and encoding == "jpeg" and self.gpujpeg_decoder:
+                def paint_gpujpeg(gl_context) -> None:
+                    self.paint_gpujpeg(gl_context, encoding, img_data, x, y, width, height,
+                                       options, callbacks)
+                self.with_gfx_context(paint_gpujpeg)
+                return
+            img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+            if img is not None:
+                self.paint_image_wrapper(encoding, img, x, y, width, height, options, callbacks)
+                return
             if self.nvjpeg_decoder and NVJPEG:
                 def paint_nvjpeg(gl_context) -> None:
                     self.paint_nvjpeg(gl_context, encoding, img_data, x, y, width, height, options, callbacks)
@@ -1359,6 +1377,62 @@ class GLWindowBackingBase(WindowBackingBase):
         else:
             img = self.jpeg_decoder.decompress_to_rgb(img_data, options)
         self.paint_image_wrapper(encoding, img, x, y, width, height, options, callbacks)
+
+    def paint_gpujpeg(self, gl_context, encoding: str, img_data, x: int, y: int,
+                      width: int, height: int,
+                      options: typedict, callbacks: PaintCallbacks) -> None:
+        # the decoder writes BGRX straight into the CUDA-mapped PBO
+        # (decode_into_gl_buffer: register/map/decode/unmap in one
+        # call) -> rectangle texture -> blit into the offscreen FBO
+        self.gl_init(gl_context)
+        size = width * height * 4
+        pbo = glGenBuffers(1)
+        try:
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo)
+            glBufferData(GL_PIXEL_UNPACK_BUFFER, size, None, GL_STREAM_DRAW)
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+            try:
+                self.gpujpeg_decoder.decode_into_gl_buffer("BGRX", img_data, options,
+                                                           int(pbo), width, height)
+            except (RuntimeError, ValueError) as e:
+                log(f"gpujpeg zero-copy decode failed: {e} - using the host path")
+                img = self.gpujpeg_decode(encoding, img_data, width, height, options)
+                if img is not None:
+                    self.do_paint_image_wrapper(gl_context, encoding, img, x, y,
+                                                width, height, options, callbacks)
+                    return
+                raise
+
+            target = GL_TEXTURE_RECTANGLE
+            glBindTexture(target, self.textures[TEX_RGB])
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo)
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0)
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+            glTexImage2D(target, 0, self.internal_format, width, height, 0,
+                         GL_BGRA, GL_UNSIGNED_BYTE, None)
+            glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        finally:
+            glDeleteBuffers(1, [pbo])
+        set_alignment(width, width * 4, "BGRX")
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, self.tmp_fbo)
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target,
+                               self.textures[TEX_RGB], 0)
+        glReadBuffer(GL_COLOR_ATTACHMENT0)
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.offscreen_fbo)
+        glBindTexture(target, self.textures[TEX_FBO])
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, target,
+                               self.textures[TEX_FBO], 0)
+        glDrawBuffer(GL_COLOR_ATTACHMENT1)
+        rh = self.size[1]
+        glBlitFramebuffer(0, 0, width, height,
+                          x, rh - y, x + width, rh - y - height,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST)
+        glBindTexture(target, 0)
+
+        self.paint_box(encoding, x, y, width, height)
+        self.painted(gl_context, x, y, width, height, options.intget("flush", 0))
+        fire_paint_callbacks(callbacks)
 
     def cuda_buffer_to_pbo(self, gl_context, cuda_buffer, rowstride: int, src_y: int, height: int, stream):
         # must be called with an active cuda context, and from the UI thread
