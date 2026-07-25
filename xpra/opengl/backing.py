@@ -290,6 +290,14 @@ class GLWindowBackingBase(WindowBackingBase):
         self.vdpau_decoder = None           # decoder whose device is pinned by this backing
         self.vdpau_registrations: dict[int, tuple[int, tuple[int, ...]]] = {}
         self.texture_size: tuple[int, int] = (0, 0)
+        # current storage size of whatever texture sits in the TEX_TMP_FBO
+        # slot (swap_fbos alternates the GL name, the slot is stable;
+        # init_fbo is the sole writer).  1x1 until real storage is
+        # needed: full window size during the resize prologue and,
+        # lazily, while the window scrolls (snapshot source; released
+        # back to 1x1 by the next resize).  Windows that never scroll
+        # never pay it.
+        self.tmp_texture_size: tuple[int, int] = (0, 0)
         self.gl_setup = False
         self.debug_setup = False
         self.border: WindowBorder = WindowBorder(shown=False)
@@ -437,10 +445,10 @@ class GLWindowBackingBase(WindowBackingBase):
         dy = (bh - h) - dy
         # re-init our OpenGL context with the new size,
         # but leave offscreen fbo with the old size
+        # (gl_init leaves the new-size tmp bound + cleared via init_fbo,
+        # and copy_fbo clears it again after attaching - no separate
+        # draw_to_tmp + clear needed here)
         self.gl_init(context, True)
-        self.draw_to_tmp()
-        glClearColor(0, 0, 0, 1)
-        glClear(GL_COLOR_BUFFER_BIT)
         if RESIZE_GLFINISH:
             glFinish()
         # copy offscreen to new tmp:
@@ -454,10 +462,11 @@ class GLWindowBackingBase(WindowBackingBase):
             self.paint_box("padding", oldw, 0, bw - oldw, bh)
         if bh > oldh:
             self.paint_box("padding",0, oldh, bw, bh - oldh)
-        # now we don't need the old tmp fbo contents anymore,
-        # and we can re-initialize it with the correct size:
+        # now we don't need the old tmp fbo contents anymore (the old
+        # offscreen texture landed in the TMP slot via swap_fbos) -
+        # release its window-sized storage down to the 1x1 stub:
         mag_filter = self.get_init_magfilter()
-        self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, bw, bh, mag_filter)
+        self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, 1, 1, mag_filter)
         if RESIZE_GLFINISH:
             glFinish()
         self._backing.queue_draw_area(0, 0, bw, bh)
@@ -630,8 +639,16 @@ class GLWindowBackingBase(WindowBackingBase):
             self.init_textures()
 
         mag_filter = self.get_init_magfilter()
-        # Define empty tmp FBO
-        self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, w, h, mag_filter)
+        # Define the tmp FBO texture.  Full (new) size ONLY on the resize
+        # prologue (skip_fbo=True): there it becomes the window's new
+        # offscreen via swap_fbos - a content-preserving resize needs old
+        # and new alive for one frame.  Otherwise a 1x1 stub: the scroll
+        # path allocates its snapshot lazily at its own size (see
+        # do_scroll_paints), so windows that never scroll keep 4 bytes
+        # here instead of 8MB+ at maximized sizes (matters on a 512MB
+        # GT 130).
+        tw, th = (w, h) if skip_fbo else (1, 1)
+        self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, tw, th, mag_filter)
         if not skip_fbo:
             # Define empty FBO texture and set rendering to FBO
             self.init_fbo(TEX_FBO, self.offscreen_fbo, w, h, mag_filter)
@@ -662,6 +679,10 @@ class GLWindowBackingBase(WindowBackingBase):
         glDrawBuffer(GL_COLOR_ATTACHMENT0)
         glClearColor(0, 0, 0, 1)
         glClear(GL_COLOR_BUFFER_BIT)
+        if texture_index == TEX_TMP_FBO:
+            # sole writer of the TMP-slot storage-size tracker
+            # (see do_scroll_paints / resize_fbo)
+            self.tmp_texture_size = (w, h)
 
     def close_gl_config(self) -> None:
         """
@@ -718,6 +739,11 @@ class GLWindowBackingBase(WindowBackingBase):
             if ofbo is not None:
                 self.offscreen_fbo = None
                 glDeleteFramebuffers(1, [ofbo])
+            tfbo = self.tmp_fbo
+            if tfbo is not None:
+                self.tmp_fbo = None
+                glDeleteFramebuffers(1, [tfbo])
+            self.tmp_texture_size = (0, 0)
             textures = self.textures
             if len(textures) > 0:
                 self.textures = []
@@ -753,12 +779,37 @@ class GLWindowBackingBase(WindowBackingBase):
             fire_paint_callbacks(callbacks, False, msg)
 
         bw, bh = self.size
-        self.copy_fbo(bw, bh)
+        target = GL_TEXTURE_RECTANGLE
 
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, self.tmp_fbo)
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.offscreen_fbo)
-        glFlush()
+        # LAZY-SNAPSHOT scroll: blit the whole offscreen into the tmp
+        # texture once per packet, then blit every rect from that
+        # pristine copy back into the offscreen at its scrolled position.
+        # This is exactly the server's model - it computes all rects of
+        # a packet against the same pre-scroll frame, so rect order
+        # cannot matter - at the cost of one window-sized texture,
+        # allocated lazily on the first scroll packet and released back
+        # to the 1x1 stub at the next resize.  Windows that never scroll
+        # (video) never allocate it.  (An in-place banded variant was
+        # tried 2026-07-25 and reverted: correct, but the ordering
+        # constraints - per-band, per-rect and cross-delta - cost ~100
+        # lines of subtlety for one texture's worth of VRAM.)
 
+        def read_from(fbo, tex: int) -> None:
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo)
+            glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[tex], 0)
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+
+        def draw_to(fbo, tex: int) -> None:
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo)
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[tex], 0)
+            glDrawBuffer(GL_COLOR_ATTACHMENT0)
+
+        def ensure_tmp(sw: int, sh: int) -> None:
+            if self.tmp_texture_size != (sw, sh):
+                self.init_fbo(TEX_TMP_FBO, self.tmp_fbo, sw, sh, self.get_init_magfilter())
+
+        # validate and clamp into the work list
+        todo: list[tuple[int, int, int, int, int, int]] = []
         for x, y, w, h, xdelta, ydelta in scrolls:
             if abs(xdelta) >= bw:
                 fail(f"invalid xdelta value: {xdelta}, backing width is {bw}")
@@ -775,18 +826,22 @@ class GLWindowBackingBase(WindowBackingBase):
             # these should be errors,
             # but desktop-scaling can cause a mismatch between the backing size
             # and the real window size server-side... so we clamp the dimensions instead
+            if x < 0:
+                w += x
+                x = 0
+            if y < 0:
+                h += y
+                y = 0
             if x + w > bw:
                 w = bw - x
             if y + h > bh:
                 h = bh - y
             if x + w + xdelta > bw:
                 w = bw - x - xdelta
-                if w <= 0:
-                    continue  # nothing left!
             if y + h + ydelta > bh:
                 h = bh - y - ydelta
-                if h <= 0:
-                    continue  # nothing left!
+            if w <= 0 or h <= 0:
+                continue  # nothing left!
             if x + xdelta < 0:
                 rect = (x, y, w, h)
                 fail(f"horizontal scroll {x} by {xdelta} rectangle {rect} overflows the backing buffer size {self.size}")
@@ -795,20 +850,36 @@ class GLWindowBackingBase(WindowBackingBase):
                 rect = (x, y, w, h)
                 fail(f"vertical scroll {y} by {ydelta} rectangle {rect} overflows the backing buffer size {self.size}")
                 continue
-            # opengl buffer is upside down, so we must invert Y coordinates: bh-(..)
-            glBlitFramebuffer(x, bh - y, x + w, bh - (y + h),
-                              x + xdelta, bh - (y + ydelta), x + w + xdelta, bh - (y + h + ydelta),
-                              GL_COLOR_BUFFER_BIT, GL_NEAREST)
-            self.paint_box("scroll", x + xdelta, y + ydelta, x + w + xdelta, y + h + ydelta)
+            todo.append((x, y, w, h, xdelta, ydelta))
+
+        if todo:
+            ensure_tmp(bw, bh)
+            self.copy_fbo(bw, bh)
+            for x, y, w, h, xdelta, ydelta in todo:
+                # per rect: paint_box (below) re-attaches TEX_RGB to the
+                # tmp READ framebuffer when the debug env enables it, so
+                # the snapshot source must be re-established each time
+                read_from(self.tmp_fbo, TEX_TMP_FBO)
+                draw_to(self.offscreen_fbo, TEX_FBO)
+                # opengl buffer is upside down, so invert Y: bh-(..)
+                glBlitFramebuffer(x, bh - y, x + w, bh - (y + h),
+                                  x + xdelta, bh - (y + ydelta), x + w + xdelta, bh - (y + h + ydelta),
+                                  GL_COLOR_BUFFER_BIT, GL_NEAREST)
+                self.paint_box("scroll", x + xdelta, y + ydelta, x + w + xdelta, y + h + ydelta)
+            # the snapshot stays allocated until the next resize releases
+            # it: a per-packet realloc would churn ~8MB through the
+            # allocator on every scroll burst instead
 
         glFlush()
 
-        target = GL_TEXTURE_RECTANGLE
-        # restore normal paint state:
-        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[TEX_FBO], 0)
+        # restore normal paint state - bind BEFORE attaching: when every
+        # rect was skipped, the current DRAW binding is whatever the
+        # previous paint left behind (possibly the default framebuffer or
+        # the scaled-paint FBOs) and attaching to that would corrupt it:
         glBindFramebuffer(GL_READ_FRAMEBUFFER, self.offscreen_fbo)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.offscreen_fbo)
         glBindFramebuffer(GL_FRAMEBUFFER, self.offscreen_fbo)
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[TEX_FBO], 0)
 
         glBindTexture(target, 0)
         self.painted(context, 0, 0, bw, bh, flush)
@@ -836,6 +907,11 @@ class GLWindowBackingBase(WindowBackingBase):
 
     def swap_fbos(self) -> None:
         log("swap_fbos()")
+        # NOTE: tmp_texture_size is stale from here until resize_fbo's
+        # closing init_fbo(TEX_TMP_FBO, ..., 1, 1) - the slot now holds
+        # the OLD offscreen texture at the old size.  Unobservable today:
+        # resize_fbo is one synchronous gl-context callback and nothing
+        # in between consults the tracker.
         # swap references to tmp and offscreen so tmp becomes the new offscreen:
         tmp = self.offscreen_fbo
         self.offscreen_fbo = self.tmp_fbo
@@ -843,6 +919,21 @@ class GLWindowBackingBase(WindowBackingBase):
         tmp = self.textures[TEX_FBO]
         self.textures[TEX_FBO] = self.textures[TEX_TMP_FBO]
         self.textures[TEX_TMP_FBO] = tmp
+
+    def shrink_rgb_texture(self) -> None:
+        # release TEX_RGB's window-sized storage now that its blit into the
+        # offscreen FBO is done: every consumer re-specifies the storage at
+        # its own size on each call and nothing reads it back, so keeping
+        # last-paint-sized storage between paints is pure waste (8MB+ after
+        # a full-window paint at maximized sizes).  Detach from the READ
+        # framebuffer (still bound to tmp_fbo at the call sites) before the
+        # respec; bare glTexImage2D only - filter/wrap params are owned by
+        # the consumers.
+        target = GL_TEXTURE_RECTANGLE
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, 0, 0)
+        glBindTexture(target, self.textures[TEX_RGB])
+        glTexImage2D(target, 0, self.internal_format, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, None)
+        glBindTexture(target, 0)
 
     def painted(self, context, x: int, y: int, w: int, h: int, flush=0) -> None:
         if self.draw_needs_refresh:
@@ -1204,13 +1295,6 @@ class GLWindowBackingBase(WindowBackingBase):
         r, g, b, a = tuple(round(v * 256) for v in color)
         with TemporaryViewport(0, 0, bw, bh):
             self.draw_rectangle(x, y, w, h, self.paint_box_line_width, r, g, b, a, bh)
-
-    def draw_to_tmp(self) -> None:
-        target = GL_TEXTURE_RECTANGLE
-        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, self.tmp_fbo)
-        glBindTexture(target, self.textures[TEX_TMP_FBO])
-        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, target, self.textures[TEX_TMP_FBO], 0)
-        glDrawBuffer(GL_COLOR_ATTACHMENT0)
 
     def draw_to_offscreen(self) -> None:
         # render to offscreen fbo:
@@ -1590,6 +1674,7 @@ class GLWindowBackingBase(WindowBackingBase):
                           GL_COLOR_BUFFER_BIT, GL_NEAREST)
 
         glBindTexture(target, 0)
+        self.shrink_rgb_texture()
 
         self.paint_box(encoding, x, y, width, height)
         self.painted(gl_context, x, y, width, height, options.intget("flush", 0))
@@ -1689,6 +1774,7 @@ class GLWindowBackingBase(WindowBackingBase):
                               GL_COLOR_BUFFER_BIT, GL_NEAREST)
 
             glBindTexture(target, 0)
+            self.shrink_rgb_texture()
 
             self.paint_box(encoding, x, y, render_width, render_height)
             self.painted(context, x, y, render_width, render_height, options.intget("flush", 0))

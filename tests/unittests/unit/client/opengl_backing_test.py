@@ -563,6 +563,8 @@ class TestGLInit(unittest.TestCase):
 
     def test_copy_fbo(self):
         """copy_fbo blits offscreen FBO into the tmp FBO without error."""
+        from xpra.opengl.backing import TEX_TMP_FBO
+        from OpenGL.GL import GL_NEAREST as nearest
         backing, win = self._make_gl_backing()
         try:
             ctx = backing.gl_context()
@@ -570,6 +572,10 @@ class TestGLInit(unittest.TestCase):
                 with ctx:
                     backing.gl_init(ctx)
                     w, h = backing.size
+                    # gl_init leaves the tmp texture as a 1x1 stub;
+                    # copy_fbo callers must size it first:
+                    backing.init_fbo(TEX_TMP_FBO, backing.tmp_fbo, w, h, nearest)
+                    assert backing.tmp_texture_size == (w, h)
                     backing.copy_fbo(w, h)
         finally:
             backing.close()
