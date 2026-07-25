@@ -476,12 +476,14 @@ class TestScrollPaints(unittest.TestCase):
         b.tmp_fbo = 11
         b.textures = list(range(N_TEXTURES))
         with (
+            patch.object(b, "init_fbo"),
             patch.object(b, "copy_fbo"),
             patch.object(b, "paint_box"),
             patch.object(b, "painted"),
             patch("xpra.opengl.backing.glBindFramebuffer"),
             patch("xpra.opengl.backing.glFramebufferTexture2D"),
             patch("xpra.opengl.backing.glReadBuffer"),
+            patch("xpra.opengl.backing.glDrawBuffer"),
             patch("xpra.opengl.backing.glBindTexture"),
             patch("xpra.opengl.backing.glFlush"),
             patch("xpra.opengl.backing.glBlitFramebuffer") as blit,
@@ -511,12 +513,14 @@ class TestScrollPaints(unittest.TestCase):
                 events.append("snapshot")
 
         with (
+            patch.object(b, "init_fbo"),
             patch.object(b, "copy_fbo"),
             patch.object(b, "paint_box", side_effect=lambda *args: events.append("paint")),
             patch.object(b, "painted"),
             patch("xpra.opengl.backing.glBindFramebuffer"),
             patch("xpra.opengl.backing.glFramebufferTexture2D", side_effect=attached),
             patch("xpra.opengl.backing.glReadBuffer"),
+            patch("xpra.opengl.backing.glDrawBuffer"),
             patch("xpra.opengl.backing.glBindTexture"),
             patch("xpra.opengl.backing.glFlush"),
             patch("xpra.opengl.backing.glBlitFramebuffer", side_effect=lambda *args: events.append("blit")),
@@ -830,12 +834,18 @@ class TestGLInit(unittest.TestCase):
 
     def test_copy_fbo(self):
         """copy_fbo blits offscreen FBO into the tmp FBO without error."""
+        from xpra.opengl.backing import TEX_TMP_FBO
+        from OpenGL.GL import GL_NEAREST as nearest
         backing, win = self._make_gl_backing()
         try:
             if ctx := backing.gl_context():
                 with ctx:
                     backing.gl_init(ctx)
                     w, h = backing.size
+                    # gl_init leaves the tmp texture as a 1x1 stub;
+                    # copy_fbo callers must size it first:
+                    backing.init_fbo(TEX_TMP_FBO, backing.tmp_fbo, w, h, nearest)
+                    assert backing.tmp_texture_size == (w, h)
                     backing.copy_fbo(w, h)
         finally:
             backing.close()
