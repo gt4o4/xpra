@@ -242,6 +242,11 @@ class CodecSpec:
     min_h           : int = 1
     max_w           : int = 4 * 1024
     max_h           : int = 4 * 1024
+    # maximum total pixels per frame (0 = no limit): hardware decoders
+    # often have an AREA limit that max_w/max_h alone cannot express,
+    # ie: VDPAU feature-set-A caps H264 at 8192 macroblocks (2097152
+    # pixels) while allowing 2048 in each dimension
+    max_pixels      : int = 0
     can_scale       : bool = False
     score_boost     : int = 0
     width_mask      : int = 0xFFFF
@@ -275,7 +280,19 @@ class CodecSpec:
         return v
 
     def get_instance_count(self) -> int:
-        return len(get_instances(self.codec_class))
+        # closed instances may linger (deferred teardown while their
+        # decoded frames are still in the paint pipeline) - they no
+        # longer consume a codec slot, so don't count them
+        count = 0
+        for instance in tuple(get_instances(self.codec_class)):
+            is_closed = getattr(instance, "is_closed", None)
+            try:
+                if callable(is_closed) and is_closed():
+                    continue
+            except Exception:
+                pass
+            count += 1
+        return count
 
     def to_dict(self, *skip: str) -> dict[str, Any]:
         # note: no `asdict()` here - it deep-copies every value before we get

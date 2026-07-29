@@ -3,15 +3,12 @@
  * Xpra is released under the terms of the GNU GPL v2, or, at your option, any
  * later version. See the file COPYING for details.
  * ABOUTME: libva decoder - C implementation.
- * ABOUTME: Minimal VA-API H.264 decoder with NV12/YUV444 output extraction. */
+ * ABOUTME: Minimal VA-API H.264 decoder, zero-copy VdpVideoSurface export. */
 
 #include "va_decode.h"
 #include "va_common.h"
-#include "va_vpx_tables.h"
 
 #include <va/va.h>
-#include <va/va_dec_vp8.h>
-#include <va/va_dec_vp9.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -23,12 +20,12 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <dlfcn.h>
 #include <time.h>
 
 #define LIBVA_LOG2_MAX_FRAME_NUM_MINUS4 4
 #define LIBVA_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4 4
-#define LIBVA_FRAME_NUM_BITS (LIBVA_LOG2_MAX_FRAME_NUM_MINUS4 + 4)
-#define LIBVA_POC_LSB_BITS (LIBVA_LOG2_MAX_PIC_ORDER_CNT_LSB_MINUS4 + 4)
 
 static libva_log_fn g_log_fn = NULL;
 static char g_device[256] = "";
@@ -38,22 +35,74 @@ static int g_major = 0;
 static int g_minor = 0;
 static int g_h264_420_supported = 0;
 static VAProfile g_h264_420_profile = VAProfileH264ConstrainedBaseline;
-static int g_h264_444_supported = 0;
-static VAProfile g_h264_444_profile = VAProfileH264High;
-static int g_vp8_420_supported = 0;
-static int g_vp9_420_supported = 0;
-static int g_vp9_444_supported = 0;
 
 struct H264Params;
-struct VP8State;
+
+/* H.264 decoded picture buffer: up to 16 reference frames (spec DPB
+ * ceiling), progressive only (field coding is rejected at parse). */
+#define H264_DPB_SIZE 16
+/* export slack: frames handed to the GL painter (zero-copy path) not
+ * yet released.  Steady-state is 1-2 in flight, but a window resize
+ * stalls the paint pipeline (GL backing re-init) while the server
+ * keeps sending, so decode runs ahead and pins pile up.  MEASURED
+ * (two-window gears, maximize/unmaximize cycles): slack 3 = a
+ * restart storm on every maximize (8 pool-exhaustions + 38 mid-GOP
+ * slice errors cascading until the next IDR, ~15 decoder
+ * generations); slack 5 = occasional single exhaustion per couple
+ * of cycles; slack 8 = clean.  Exhaustion stays a decode error +
+ * restart, never corruption.
+ * 2026-07-25: dialed 8 -> 5 -> 3 (VRAM audit: a maximized window
+ * cost ~295MB of the GT 130's 512; each slack frame is ~2.9MB at
+ * 1856x1088).  The slack-3/5 numbers above are from the ORIGINAL
+ * 2026-07-20 measurement; the pipeline has since gained the
+ * partial-vaCreateSurfaces fix, per-decoder displays and faster
+ * paints, and slack 5 retested CLEAN under the same churn (12
+ * resize transitions incl. 1228x861: 0 exhaustions).  Slack 3 is
+ * the next probe of the new floor - exhaustion is a clean decoder
+ * restart (loud decode error, never corruption); restore 5 if the
+ * maximize-churn gate logs exhaustions again. */
+#define H264_EXPORT_SLACK 3
+/* the surface ARRAYS are sized for the worst case (a full spec DPB);
+ * the pool actually ALLOCATED is sized from the stream's own SPS at
+ * first decode: max_num_ref_frames + 1 current + slack - an nvenc
+ * nrf=3 stream gets 12 surfaces instead of 25 (VRAM: each surface is
+ * a full NV12 frame) */
+#define H264_NUM_SURFACES (H264_DPB_SIZE + 1 + H264_EXPORT_SLACK)
+_Static_assert(H264_NUM_SURFACES <= 32, "pinned_bits and dpb_used are 32-bit sets");
+
+/* describes the reference picture held by surfaces[i] - the surface
+ * id itself lives ONLY in surfaces[] (same index, no duplication) */
+struct H264DPBEntry {
+    int frame_num;              /* FrameNum as coded */
+    int top_foc;
+    int bottom_foc;
+    int is_long_term;
+    int long_term_frame_idx;
+};
 
 struct LibVADecoder {
     int             fd;
     VADisplay       display;
     VAConfigID      config;
     VAContextID     context;
-    VASurfaceID     surfaces[4];
+    VASurfaceID     surfaces[H264_NUM_SURFACES];
+    int             num_surfaces;
     int             surface_index;
+    /* zero-copy export path (vendor extension of the VDPAU-backed VA
+     * driver): bit i of pinned_bits marks a slot handed to the
+     * painter.  ONE ATOMIC WORD, no lock, safe by construction:
+     * pins (0->1) are set only by the decode thread, which is also
+     * the only thread that scans the set (h264_pick_surface) - so a
+     * pick can never race a pin; the sole cross-thread transition is
+     * a release (1->0) from the UI/GC thread, and a stale set-bit
+     * merely makes the picker skip a just-freed slot (conservative).
+     * seq_cst operations are used for zero reasoning burden;
+     * release-on-clear / acquire-on-load would suffice (the clear
+     * publishes the painter's completed UnmapSurfacesNV to the
+     * decode thread's reuse of the slot).
+     * export_fn is the dlsym'd vdpau_va_export_v1. */
+    _Atomic uint32_t pinned_bits;
+    void           *export_fn;
     int             width;
     int             height;
     int             surface_width;
@@ -61,30 +110,25 @@ struct LibVADecoder {
     LibVACodec      codec;
     VAProfile       profile;
     unsigned int    rt_format;
-    int             output_444;
-    unsigned long   frames;
-    int             have_reference;
-    int             ref_surface_index;
-    int             ref_frame_num;
-    int             ref_poc_lsb;
+    /* DPB metadata, parallel to surfaces[]: dpb[i] describes the
+     * reference picture held by surfaces[i] (which alone owns the
+     * surface id - VA wants surfaces[] contiguous, so the entry does
+     * not duplicate it).  The 1:1 mapping is guaranteed by
+     * progressive-only decode (a frame owns its whole surface; a
+     * field pair sharing one would break bit-per-surface) */
+    struct H264DPBEntry dpb[H264_NUM_SURFACES];
+    /* bit i set = surfaces[i] holds a reference picture - the SAME
+     * index space as pinned_bits, so the picker's busy set is one OR.
+     * Plain (not atomic): the DPB is decode-thread-private - unlike
+     * pinned_bits this is data compaction, not a concurrency fix. */
+    uint32_t        dpb_used;
+    /* picture order count state (spec 8.2.1) */
+    int             poc_prev_lsb;
+    int             poc_prev_msb;
+    int             poc_prev_frame_num;
+    int             poc_prev_frame_num_offset;
     struct H264Params *h264_params;
-    struct VP8State *vp8_state;
-    int             vpx_last_surface;
-    int             vpx_golden_surface;
-    int             vpx_alt_surface;
-    VASurfaceID     vp9_refs[8];
     int             full_range;     /* colour range from the last parsed bitstream headers */
-    int             vp9_color_range;
-    int             vp9_bit_depth;
-    int             vp9_subsampling_x;
-    int             vp9_subsampling_y;
-    int             vp9_loop_filter_ref_deltas[4];
-    int             vp9_loop_filter_mode_deltas[2];
-    int             vp9_segmentation_abs_or_delta_update;
-    int             vp9_feature_enabled[8][4];
-    int             vp9_feature_data[8][4];
-    uint8_t        *planes[3];
-    size_t          plane_caps[3];
     int             last_status;
     char            last_error[256];
     char            device[256];
@@ -146,7 +190,6 @@ struct H264SliceInfo {
     int poc_lsb;
     int num_ref_idx_l0_active_minus1;
     int num_ref_idx_l1_active_minus1;
-    int direct_spatial_mv_pred_flag;
     int cabac_init_idc;
     int slice_qp_delta;
     int disable_deblocking_filter_idc;
@@ -160,128 +203,17 @@ struct H264SliceInfo {
     uint8_t chroma_weight_l0_flag;
     int16_t chroma_weight_l0[32][2];
     int16_t chroma_offset_l0[32][2];
+    int delta_poc_bottom;             /* delta_pic_order_cnt_bottom (poc type 0) */
+    /* dec_ref_pic_marking() */
+    int idr_long_term_reference_flag;
+    int adaptive_ref_pic_marking;
+    int n_mmco;
+    struct { int op; int arg1; int arg2; } mmco[H264_DPB_SIZE + 2];
+    /* ref_pic_list_modification(), list 0 */
+    int n_ref_mod_l0;
+    struct { int idc; int val; } ref_mod_l0[32];
     int bit_offset;
 };
-
-struct VP8State {
-    uint8_t token_probs[4][8][3][11];
-    uint8_t mv_probs[2][19];
-    uint8_t y_mode_probs[4];
-    uint8_t uv_mode_probs[3];
-    int segmentation_enabled;
-    int update_mb_segmentation_map;
-    int update_segment_feature_data;
-    int segment_feature_mode;
-    int quantizer_update_value[4];
-    int lf_update_value[4];
-    uint8_t segment_prob[3];
-    int loop_filter_adj_enable;
-    int mode_ref_lf_delta_update;
-    int ref_frame_delta[4];
-    int mb_mode_delta[4];
-};
-
-struct VP8BoolReader {
-    const uint8_t *data;
-    int size;
-    int pos;
-    unsigned int range;
-    unsigned int value;
-    int count;
-};
-
-struct VP8FrameInfo {
-    int key_frame;
-    int version;
-    int show_frame;
-    int first_part_size;
-    int data_chunk_size;
-    int width;
-    int height;
-    int filter_type;
-    int loop_filter_level;
-    int sharpness_level;
-    int log2_partitions;
-    int y_ac_qi;
-    int y_dc_delta;
-    int y2_dc_delta;
-    int y2_ac_delta;
-    int uv_dc_delta;
-    int uv_ac_delta;
-    int refresh_entropy_probs;
-    int refresh_last;
-    int refresh_golden_frame;
-    int refresh_alternate_frame;
-    int copy_buffer_to_golden;
-    int copy_buffer_to_alternate;
-    int sign_bias_golden;
-    int sign_bias_alternate;
-    int mb_no_coeff_skip;
-    int prob_skip_false;
-    int prob_intra;
-    int prob_last;
-    int prob_gf;
-    int header_bits;
-    uint32_t partition_size[8];
-    struct VP8State probs;
-    struct VP8BoolReader bool_state;
-};
-
-struct VP9BitReader {
-    const uint8_t *data;
-    int size;
-    int bit_pos;
-};
-
-struct VP9FrameInfo {
-    int profile;
-    int bit_depth;
-    int color_range;
-    int subsampling_x;
-    int subsampling_y;
-    int frame_type;
-    int show_frame;
-    int error_resilient_mode;
-    int intra_only;
-    int reset_frame_context;
-    int refresh_frame_flags;
-    int ref_frame_idx[3];
-    int ref_frame_sign_bias[4];
-    int allow_high_precision_mv;
-    int interpolation_filter;
-    int refresh_frame_context;
-    int frame_parallel_decoding_mode;
-    int frame_context_idx;
-    int frame_width;
-    int frame_height;
-    int render_width;
-    int render_height;
-    int base_q_idx;
-    int delta_q_y_dc;
-    int delta_q_uv_dc;
-    int delta_q_uv_ac;
-    int lossless;
-    int loop_filter_level;
-    int loop_filter_sharpness;
-    int loop_filter_delta_enabled;
-    int loop_filter_ref_deltas[4];
-    int loop_filter_mode_deltas[2];
-    int segmentation_enabled;
-    int segmentation_update_map;
-    int segmentation_temporal_update;
-    uint8_t segmentation_tree_probs[7];
-    uint8_t segmentation_pred_probs[3];
-    int segmentation_abs_or_delta_update;
-    int feature_enabled[8][4];
-    int feature_data[8][4];
-    int tile_cols_log2;
-    int tile_rows_log2;
-    int uncompressed_header_bytes;
-    int first_partition_size;
-};
-
-static void init_vp8_state(struct VP8State *state);
-static void init_vp9_state(LibVADecoder *dec);
 
 void libva_decode_set_log(libva_log_fn fn) {
     g_log_fn = fn;
@@ -342,16 +274,6 @@ const char* libva_decode_status_str(LibVADecodeStatus status) {
     }
 }
 
-const char* libva_decode_format_str(LibVADecodeFormat format) {
-    switch (format) {
-        case LIBVA_DEC_FMT_NV12:    return "NV12";
-        case LIBVA_DEC_FMT_YUV444P: return "YUV444P";
-        case LIBVA_DEC_FMT_XYUV:    return "XYUV";
-        case LIBVA_DEC_FMT_AYUV:    return "AYUV";
-        default:                    return "unknown";
-    }
-}
-
 static int vld_supported(VADisplay display, VAProfile profile, unsigned int rt_format) {
     VAEntrypoint entrypoints[32];
     int nentrypoints = 0;
@@ -381,9 +303,8 @@ static int try_device(const char *device) {
     char vendor[256] = "";
     VAProfile profiles[64];
     int nprofiles = 0;
-    int h264_420 = 0, h264_444 = 0, vp8_420 = 0, vp9_420 = 0, vp9_444 = 0;
+    int h264_420 = 0;
     VAProfile h264_420_profile = VAProfileH264ConstrainedBaseline;
-    VAProfile h264_444_profile = VAProfileH264High;
     VAStatus status;
 
     if (!libva_open_display(device, &fd, &display, &major, &minor, vendor, sizeof(vendor),
@@ -395,6 +316,7 @@ static int try_device(const char *device) {
         snprintf(g_error, sizeof(g_error), "vaQueryConfigProfiles failed: %s (%d)",
                  vaErrorStr(status), (int)status);
         vaTerminate(display);
+        libva_x11_close(display);
         if (fd >= 0)
             close(fd);
         return 0;
@@ -414,41 +336,21 @@ static int try_device(const char *device) {
             break;
         }
     }
-    for (unsigned int i = 0; i < sizeof(h264_profiles) / sizeof(h264_profiles[0]); i++) {
-        VAProfile profile = h264_profiles[i];
-        if (profile_supported(profiles, nprofiles, profile) &&
-            vld_supported(display, profile, VA_RT_FORMAT_YUV444)) {
-            h264_444 = 1;
-            h264_444_profile = profile;
-            break;
-        }
-    }
-    if (profile_supported(profiles, nprofiles, VAProfileVP8Version0_3))
-        vp8_420 = vld_supported(display, VAProfileVP8Version0_3, VA_RT_FORMAT_YUV420);
-    if (profile_supported(profiles, nprofiles, VAProfileVP9Profile0))
-        vp9_420 = vld_supported(display, VAProfileVP9Profile0, VA_RT_FORMAT_YUV420);
-    if (profile_supported(profiles, nprofiles, VAProfileVP9Profile1))
-        vp9_444 = vld_supported(display, VAProfileVP9Profile1, VA_RT_FORMAT_YUV444);
-
     vaTerminate(display);
+    libva_x11_close(display);
     if (fd >= 0)
         close(fd);
-    if (h264_420 || h264_444 || vp8_420 || vp9_420 || vp9_444) {
+    if (h264_420) {
         snprintf(g_device, sizeof(g_device), "%s", device);
         snprintf(g_vendor, sizeof(g_vendor), "%s", vendor);
         g_major = major;
         g_minor = minor;
         g_h264_420_supported = h264_420;
         g_h264_420_profile = h264_420_profile;
-        g_h264_444_supported = h264_444;
-        g_h264_444_profile = h264_444_profile;
-        g_vp8_420_supported = vp8_420;
-        g_vp9_420_supported = vp9_420;
-        g_vp9_444_supported = vp9_444;
-        libva_log("libva decode: selected %s (%s), h264-420=%d h264-444=%d vp8-420=%d vp9-420=%d vp9-444=%d",
-                  g_device, g_vendor, h264_420, h264_444, vp8_420, vp9_420, vp9_444);
+        libva_log("libva decode: selected %s (%s), h264-420=%d",
+                  g_device, g_vendor, h264_420);
     }
-    return h264_420 || h264_444 || vp8_420 || vp9_420 || vp9_444;
+    return h264_420;
 }
 
 #ifdef _WIN32
@@ -490,6 +392,10 @@ LibVADecodeStatus libva_decode_startup(void) {
         }
         closedir(dir);
     }
+    /* no render node worked: try an X11 VA display (VDPAU-backed VA
+     * drivers have no DRM path at all) */
+    if (try_device("x11"))
+        return LIBVA_DEC_OK;
     if (!g_error[0])
         snprintf(g_error, sizeof(g_error), "no VA-API render node found");
     return LIBVA_DEC_NOT_AVAILABLE;
@@ -526,20 +432,8 @@ int libva_decode_supports(const char *encoding, const char *colorspace) {
         return 0;
     if (!codec_from_name(encoding, &codec))
         return 0;
-    if (codec == LIBVA_CODEC_H264) {
-        if (strcmp(colorspace, "YUV420P") == 0)
-            return g_h264_420_supported;
-        if (strcmp(colorspace, "YUV444P") == 0)
-            return g_h264_444_supported;
-    }
-    if (codec == LIBVA_CODEC_VP8 && strcmp(colorspace, "YUV420P") == 0)
-        return g_vp8_420_supported;
-    if (codec == LIBVA_CODEC_VP9) {
-        if (strcmp(colorspace, "YUV420P") == 0)
-            return g_vp9_420_supported;
-        if (strcmp(colorspace, "YUV444P") == 0)
-            return g_vp9_444_supported;
-    }
+    if (codec == LIBVA_CODEC_H264 && strcmp(colorspace, "YUV420P") == 0)
+        return g_h264_420_supported;
     return 0;
 }
 
@@ -558,13 +452,57 @@ static void destroy_buffers(LibVADecoder *dec, VABufferID *buffers, int count) {
     }
 }
 
+/* allocate dec->num_surfaces surfaces + the VA context - runs at
+ * FIRST DECODE, once the pool has been sized from the stream's SPS */
+static LibVADecodeStatus alloc_surfaces_and_context(LibVADecoder *dec) {
+    VASurfaceAttrib surface_attrs[2];
+    VAStatus status;
+    memset(surface_attrs, 0, sizeof(surface_attrs));
+    surface_attrs[0].type = VASurfaceAttribPixelFormat;
+    surface_attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    surface_attrs[0].value.type = VAGenericValueTypeInteger;
+    surface_attrs[0].value.value.i = VA_FOURCC_NV12;
+    surface_attrs[1].type = VASurfaceAttribUsageHint;
+    surface_attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
+    surface_attrs[1].value.type = VAGenericValueTypeInteger;
+    surface_attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
+    status = vaCreateSurfaces(dec->display, dec->rt_format,
+                              (unsigned int)dec->surface_width,
+                              (unsigned int)dec->surface_height,
+                              dec->surfaces, (unsigned int)dec->num_surfaces,
+                              surface_attrs, 2);
+    if (status != VA_STATUS_SUCCESS) {
+        /* VA-API leaves the output array UNDEFINED on failure, and the
+         * VDPAU bridge (pre-fix) left the ids of partially-created,
+         * already-destroyed surfaces in it - our teardown would then
+         * re-destroy them (the vdpau_DestroySurfaces assert = SIGABRT
+         * under VRAM pressure).  Never trust the array on error. */
+        for (int i = 0; i < H264_NUM_SURFACES; i++)
+            dec->surfaces[i] = VA_INVALID_SURFACE;
+        return set_error(dec, status, "vaCreateSurfaces");
+    }
+    status = vaCreateContext(dec->display, dec->config,
+                             dec->surface_width, dec->surface_height,
+                             VA_PROGRESSIVE, dec->surfaces, dec->num_surfaces,
+                             &dec->context);
+    if (status != VA_STATUS_SUCCESS) {
+        /* decode re-entry would allocate a fresh pool over this
+         * array, orphaning these surfaces in the driver */
+        vaDestroySurfaces(dec->display, dec->surfaces, dec->num_surfaces);
+        for (int i = 0; i < H264_NUM_SURFACES; i++)
+            dec->surfaces[i] = VA_INVALID_SURFACE;
+        dec->context = VA_INVALID_ID;
+        return set_error(dec, status, "vaCreateContext");
+    }
+    return LIBVA_DEC_OK;
+}
+
 LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
                                        int width, int height, const char *colorspace) {
     LibVACodec codec;
     LibVADecoder *dec;
     VAStatus status;
     VAConfigAttrib attr;
-    VASurfaceAttrib surface_attrs[2];
     int major = 0, minor = 0;
 
     if (!out)
@@ -588,45 +526,43 @@ LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
         return LIBVA_DEC_ERROR;
     }
     init_h264_params(dec->h264_params);
-    dec->vp8_state = (struct VP8State *)calloc(1, sizeof(*dec->vp8_state));
-    if (!dec->vp8_state) {
-        free(dec->h264_params);
-        free(dec);
-        return LIBVA_DEC_ERROR;
-    }
-    init_vp8_state(dec->vp8_state);
     dec->fd = -1;
     dec->config = VA_INVALID_ID;
     dec->context = VA_INVALID_ID;
-    for (int i = 0; i < 4; i++)
+    /* the pool is sized from the stream's SPS at first decode */
+    dec->num_surfaces = 0;
+    for (int i = 0; i < H264_NUM_SURFACES; i++)
         dec->surfaces[i] = VA_INVALID_SURFACE;
-    for (int i = 0; i < 8; i++)
-        dec->vp9_refs[i] = VA_INVALID_SURFACE;
-    dec->vpx_last_surface = -1;
-    dec->vpx_golden_surface = -1;
-    dec->vpx_alt_surface = -1;
-    init_vp9_state(dec);
     dec->width = width;
     dec->height = height;
-    dec->surface_width = roundup(width, 16);
-    dec->surface_height = roundup(height, 16);
+    /* surfaces must hold the CODED picture, and encoders pad the coded
+     * size beyond macroblock alignment - nvenc to 32-aligned dims (a
+     * 1228x861 target arrives coded 1248x864).  16-aligned surfaces
+     * made the hardware write 32-aligned rows past the row end: whole-
+     * frame mosaic garbage for every size where the two alignments
+     * differ (all common test sizes happened to be 32-aligned - this
+     * hid the bug until a 31/32-scaled window landed on 1228 wide).
+     * Oversized surfaces are safe: decode fills the top-left, the
+     * display rectangle crops. */
+    dec->surface_width = roundup(width, 32);
+    dec->surface_height = roundup(height, 32);
     dec->codec = codec;
     dec->rt_format = VA_RT_FORMAT_YUV420;
     dec->profile = g_h264_420_profile;
-    if (codec == LIBVA_CODEC_VP8) {
-        dec->profile = VAProfileVP8Version0_3;
-    } else if (codec == LIBVA_CODEC_VP9) {
-        dec->profile = strcmp(colorspace, "YUV444P") == 0 ? VAProfileVP9Profile1 : VAProfileVP9Profile0;
-    } else if (strcmp(colorspace, "YUV444P") == 0) {
-        dec->rt_format = VA_RT_FORMAT_YUV444;
-        dec->profile = g_h264_444_profile;
-        dec->output_444 = 1;
-    }
-    if (codec == LIBVA_CODEC_VP9 && strcmp(colorspace, "YUV444P") == 0) {
-        dec->rt_format = VA_RT_FORMAT_YUV444;
-        dec->output_444 = 1;
-    }
     dec->last_status = VA_STATUS_SUCCESS;
+    atomic_init(&dec->pinned_bits, 0);
+    /* zero-copy export: H264 decode is export-only - the frames stay
+     * on the GPU as VdpVideoSurfaces for GL_NV_vdpau_interop; the
+     * VDPAU-backed VA driver must provide the vendor export symbol */
+    if (codec == LIBVA_CODEC_H264) {
+        dec->export_fn = dlsym(RTLD_DEFAULT, "vdpau_va_export_v1");
+        if (!dec->export_fn) {
+            libva_decoder_destroy(dec);
+            snprintf(g_error, sizeof(g_error),
+                     "vdpau_va_export_v1 not exported by the VA driver");
+            return LIBVA_DEC_NOT_AVAILABLE;
+        }
+    }
     snprintf(dec->device, sizeof(dec->device), "%s", g_device);
 
     if (!libva_open_display(dec->device, &dec->fd, &dec->display, &major, &minor,
@@ -648,45 +584,28 @@ LibVADecodeStatus libva_decoder_create(LibVADecoder **out, const char *encoding,
     {
         VASurfaceAttrib qattrs[32];
         unsigned int nq = 32;
+        /* zero the array: drivers only write the entries they report,
+         * and a stale stack entry whose type happened to equal
+         * PixelFormat printed garbage fourccs (seen live with the
+         * VDPAU bridge) - zeroed entries have type VASurfaceAttribNone */
+        memset(qattrs, 0, sizeof(qattrs));
         VAStatus qst = vaQuerySurfaceAttributes(dec->display, dec->config, qattrs, &nq);
-        libva_log("VP9 dbg: vaQuerySurfaceAttributes status=%d nattrs=%u", (int)qst, nq);
-        for (unsigned int i = 0; i < nq && qst == VA_STATUS_SUCCESS; i++) {
+        libva_log("surface probe: vaQuerySurfaceAttributes status=%d nattrs=%u", (int)qst, nq);
+        if (qst == VA_STATUS_SUCCESS && nq > 32)
+            nq = 32;
+        for (unsigned int i = 0; qst == VA_STATUS_SUCCESS && i < nq; i++) {
             if (qattrs[i].type == VASurfaceAttribPixelFormat) {
                 unsigned int fourcc = (unsigned int)qattrs[i].value.value.i;
-                libva_log("VP9 dbg:   supported pixel format: %c%c%c%c (0x%08x)",
-                          fourcc & 0xff, (fourcc >> 8) & 0xff,
-                          (fourcc >> 16) & 0xff, (fourcc >> 24) & 0xff, fourcc);
+                char c[4];
+                for (int b = 0; b < 4; b++) {
+                    unsigned char ch = (unsigned char)((fourcc >> (8 * b)) & 0xff);
+                    c[b] = (ch >= 32 && ch < 127) ? (char)ch : '?';
+                }
+                libva_log("surface probe:   supported pixel format: %c%c%c%c (0x%08x)",
+                          c[0], c[1], c[2], c[3], fourcc);
             }
         }
     }
-    memset(surface_attrs, 0, sizeof(surface_attrs));
-    surface_attrs[0].type = VASurfaceAttribPixelFormat;
-    surface_attrs[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    surface_attrs[0].value.type = VAGenericValueTypeInteger;
-    surface_attrs[0].value.value.i = dec->output_444 ? VA_FOURCC_444P : VA_FOURCC_NV12;
-    surface_attrs[1].type = VASurfaceAttribUsageHint;
-    surface_attrs[1].flags = VA_SURFACE_ATTRIB_SETTABLE;
-    surface_attrs[1].value.type = VAGenericValueTypeInteger;
-    surface_attrs[1].value.value.i = VA_SURFACE_ATTRIB_USAGE_HINT_DECODER;
-    status = vaCreateSurfaces(dec->display, dec->rt_format,
-                              (unsigned int)dec->surface_width,
-                              (unsigned int)dec->surface_height,
-                              dec->surfaces, 4, surface_attrs, 2);
-    if (status != VA_STATUS_SUCCESS) {
-        set_error(dec, status, "vaCreateSurfaces");
-        libva_decoder_destroy(dec);
-        return LIBVA_DEC_ERROR;
-    }
-
-    status = vaCreateContext(dec->display, dec->config,
-                             dec->surface_width, dec->surface_height,
-                             VA_PROGRESSIVE, dec->surfaces, 4, &dec->context);
-    if (status != VA_STATUS_SUCCESS) {
-        set_error(dec, status, "vaCreateContext");
-        libva_decoder_destroy(dec);
-        return LIBVA_DEC_ERROR;
-    }
-
     libva_log("libva %s decoder create: %dx%d surface=%dx%d colorspace=%s profile=%s device=%s vendor=%s",
               codec_name(dec->codec), width, height, dec->surface_width, dec->surface_height,
               colorspace, h264_profile_name(dec->profile), dec->device, dec->vendor);
@@ -700,20 +619,18 @@ void libva_decoder_destroy(LibVADecoder *dec) {
     if (dec->display) {
         if (dec->context != VA_INVALID_ID)
             vaDestroyContext(dec->display, dec->context);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < H264_NUM_SURFACES; i++) {
             if (dec->surfaces[i] != VA_INVALID_SURFACE)
                 vaDestroySurfaces(dec->display, &dec->surfaces[i], 1);
         }
         if (dec->config != VA_INVALID_ID)
             vaDestroyConfig(dec->display, dec->config);
         vaTerminate(dec->display);
+        libva_x11_close(dec->display);
     }
     if (dec->fd >= 0)
         close(dec->fd);
-    for (int i = 0; i < 3; i++)
-        free(dec->planes[i]);
     free(dec->h264_params);
-    free(dec->vp8_state);
     free(dec);
 }
 
@@ -976,49 +893,379 @@ static void parse_h264_params(const uint8_t *data, int size, struct H264Params *
     }
 }
 
-static int skip_h264_ref_pic_list_modification(struct BitReader *br, int slice_type_mod) {
-    int flags = slice_type_mod == 1 ? 2 : 1;
+static int parse_h264_ref_pic_list_modification(struct BitReader *br, int slice_type_mod,
+                                                struct H264SliceInfo *si) {
+    si->n_ref_mod_l0 = 0;
     if (slice_type_mod == 2 || slice_type_mod == 4)
+        return 1;                     /* I/SI slices carry no lists */
+    if (br_bits(br, 1)) {             /* ref_pic_list_modification_flag_l0 */
+        unsigned int idc;
+        do {
+            idc = br_ue(br);          /* modification_of_pic_nums_idc */
+            if (idc == 3)
+                break;
+            if (idc > 2)
+                return 0;             /* MVC ops (4/5) not supported */
+            int val = (int)br_ue(br); /* abs_diff_pic_num_minus1 / long_term_pic_num */
+            if (si->n_ref_mod_l0 < 32) {
+                si->ref_mod_l0[si->n_ref_mod_l0].idc = (int)idc;
+                si->ref_mod_l0[si->n_ref_mod_l0].val = val;
+                si->n_ref_mod_l0++;
+            }
+        } while (br_bits_left(br) > 0);
+    }
+    /* B slices would carry an L1 modification loop here; B slices are
+     * rejected at slice-header parse (this decoder is IPP-only) */
+    return 1;
+}
+
+static int parse_h264_dec_ref_pic_marking(struct BitReader *br, int nal_type,
+                                          struct H264SliceInfo *si) {
+    si->idr_long_term_reference_flag = 0;
+    si->adaptive_ref_pic_marking = 0;
+    si->n_mmco = 0;
+    if (!si->nal_ref_idc)
         return 1;
-    for (int list = 0; list < flags; list++) {
-        if (br_bits(br, 1)) {         /* ref_pic_list_modification_flag_l[01] */
-            unsigned int op;
-            do {
-                op = br_ue(br);       /* modification_of_pic_nums_idc */
-                if (op == 0 || op == 1)
-                    br_ue(br);        /* abs_diff_pic_num_minus1 */
-                else if (op == 2)
-                    br_ue(br);        /* long_term_pic_num */
-                else if (op == 4 || op == 5)
-                    br_ue(br);        /* abs_diff_view_idx_minus1 */
-            } while (op != 3 && br_bits_left(br) > 0);
-        }
+    if (nal_type == 5) {
+        br_bits(br, 1);               /* no_output_of_prior_pics_flag */
+        si->idr_long_term_reference_flag = (int)br_bits(br, 1);
+        return 1;
+    }
+    si->adaptive_ref_pic_marking = (int)br_bits(br, 1);
+    if (si->adaptive_ref_pic_marking) {
+        unsigned int op;
+        do {
+            op = br_ue(br);           /* memory_management_control_operation */
+            if (op == 0)
+                break;
+            if (op > 6)
+                return 0;
+            int arg1 = 0, arg2 = 0;
+            if (op == 1 || op == 3)
+                arg1 = (int)br_ue(br);    /* difference_of_pic_nums_minus1 */
+            if (op == 2)
+                arg1 = (int)br_ue(br);    /* long_term_pic_num */
+            if (op == 3 || op == 6)
+                arg2 = (int)br_ue(br);    /* long_term_frame_idx */
+            if (op == 4)
+                arg1 = (int)br_ue(br);    /* max_long_term_frame_idx_plus1 */
+            if (si->n_mmco < (int)(sizeof(si->mmco) / sizeof(si->mmco[0]))) {
+                si->mmco[si->n_mmco].op = (int)op;
+                si->mmco[si->n_mmco].arg1 = arg1;
+                si->mmco[si->n_mmco].arg2 = arg2;
+                si->n_mmco++;
+            }
+        } while (br_bits_left(br) > 0);
     }
     return 1;
 }
 
-static void skip_h264_dec_ref_pic_marking(struct BitReader *br, int nal_type, int nal_ref_idc) {
-    if (!nal_ref_idc)
-        return;
-    if (nal_type == 5) {
-        br_bits(br, 1);               /* no_output_of_prior_pics_flag */
-        br_bits(br, 1);               /* long_term_reference_flag */
-        return;
+/* ------------------------------------------------------------------ */
+/* H.264 decoded picture buffer (progressive frames only)              */
+/* ------------------------------------------------------------------ */
+
+static void h264_dpb_flush(LibVADecoder *dec) {
+    /* emptiness is the bitmap alone - entry fields are void while
+     * their dpb_used bit is clear */
+    dec->dpb_used = 0;
+}
+
+/* PicNum for a frame (spec 8.2.4.1: FrameNumWrap, since for frames
+ * PicNum == FrameNumWrap) relative to the current frame_num */
+static int h264_pic_num(const struct H264DPBEntry *e, int cur_frame_num, int max_frame_num) {
+    if (e->frame_num > cur_frame_num)
+        return e->frame_num - max_frame_num;
+    return e->frame_num;
+}
+
+/* spec 8.2.1: picture order count, types 0 and 2 (type 1 unsupported).
+ * Progressive only. Returns 0 and fills *top_foc / *bottom_foc. */
+static int h264_compute_poc(LibVADecoder *dec, const struct H264Params *params,
+                            const struct H264SliceInfo *si, int is_idr,
+                            int *top_foc, int *bottom_foc) {
+    if (params->pic_order_cnt_type == 0) {
+        int max_lsb = 1 << (params->log2_max_pic_order_cnt_lsb_minus4 + 4);
+        int prev_lsb = is_idr ? 0 : dec->poc_prev_lsb;
+        int prev_msb = is_idr ? 0 : dec->poc_prev_msb;
+        int msb;
+        if (si->poc_lsb < prev_lsb && (prev_lsb - si->poc_lsb) >= max_lsb / 2)
+            msb = prev_msb + max_lsb;
+        else if (si->poc_lsb > prev_lsb && (si->poc_lsb - prev_lsb) > max_lsb / 2)
+            msb = prev_msb - max_lsb;
+        else
+            msb = prev_msb;
+        *top_foc = msb + si->poc_lsb;
+        *bottom_foc = *top_foc + si->delta_poc_bottom;
+        if (si->nal_ref_idc) {        /* prev state tracks reference pictures */
+            dec->poc_prev_lsb = si->poc_lsb;
+            dec->poc_prev_msb = msb;
+        }
+        return 0;
     }
-    if (br_bits(br, 1)) {             /* adaptive_ref_pic_marking_mode_flag */
-        unsigned int op;
-        do {
-            op = br_ue(br);           /* memory_management_control_operation */
-            if (op == 1 || op == 3)
-                br_ue(br);            /* difference_of_pic_nums_minus1 */
-            if (op == 2)
-                br_ue(br);            /* long_term_pic_num */
-            if (op == 3 || op == 6)
-                br_ue(br);            /* long_term_frame_idx */
-            if (op == 4)
-                br_ue(br);            /* max_long_term_frame_idx_plus1 */
-        } while (op != 0 && br_bits_left(br) > 0);
+    if (params->pic_order_cnt_type == 2) {
+        int max_frame_num = 1 << (params->log2_max_frame_num_minus4 + 4);
+        int offset;
+        if (is_idr)
+            offset = 0;
+        else if (dec->poc_prev_frame_num > si->frame_num)
+            offset = dec->poc_prev_frame_num_offset + max_frame_num;
+        else
+            offset = dec->poc_prev_frame_num_offset;
+        int poc = 2 * (offset + si->frame_num);
+        if (!si->nal_ref_idc)
+            poc -= 1;
+        *top_foc = poc;
+        *bottom_foc = poc;
+        dec->poc_prev_frame_num = si->frame_num;
+        dec->poc_prev_frame_num_offset = offset;
+        return 0;
     }
+    return -1;                        /* type 1: no real encoder emits it here */
+}
+
+/* pick a surface that is neither referenced by the DPB nor pinned by
+ * an exported (in-flight) frame; the pool = DPB size + 1 + export
+ * slack, so exhaustion needs a full DPB AND more unreleased exports
+ * than the slack - that fails the decode and restarts the decoder */
+static int h264_pick_surface(LibVADecoder *dec) {
+    /* one snapshot is enough: pins are only ever SET by this thread,
+     * so the snapshot cannot go stale in the unsafe direction (a
+     * concurrent release just means we skip a slot that became free).
+     * dpb_used shares the surface index space, so busy is one OR. */
+    const uint32_t busy = atomic_load(&dec->pinned_bits) | dec->dpb_used;
+    /* 64-bit shift: with the pool at 32 surfaces a 32-bit 1u << 32
+     * would be undefined behaviour (x86 masks it to a no-op shift) */
+    const uint32_t free_mask = (uint32_t)((1ULL << dec->num_surfaces) - 1) & ~busy;
+    /* round-robin: first free slot at index >= surface_index, wrapping.
+     * __builtin_ffs returns 1 + the lowest set bit, 0 for no bits -
+     * the wrap and the all-busy case fall out of its semantics.
+     * (ctz would need a zero guard; clz scans from the top - no use
+     * in an ascending scan.) */
+    uint32_t cand = free_mask & (~0u << dec->surface_index);
+    if (!cand)
+        cand = free_mask;
+    const int ffs = __builtin_ffs((int)cand);
+    if (ffs == 0)
+        return -1;
+    const int idx = ffs - 1;
+    dec->surface_index = (idx + 1) % dec->num_surfaces;
+    return idx;
+}
+
+/* spec 8.2.5.3: sliding-window marking - make room for one more
+ * reference by unmarking the short-term entry with the smallest
+ * FrameNumWrap */
+static void h264_dpb_sliding_window(LibVADecoder *dec, const struct H264Params *params,
+                                    int cur_frame_num) {
+    int max_frame_num = 1 << (params->log2_max_frame_num_minus4 + 4);
+    int num_ref = params->max_num_ref_frames > 0 ? params->max_num_ref_frames : 1;
+    if (num_ref > H264_DPB_SIZE)
+        num_ref = H264_DPB_SIZE;
+    int used = __builtin_popcount(dec->dpb_used);
+    while (used >= num_ref) {
+        int victim = -1, victim_pn = 0;
+        for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+            int i = __builtin_ctz(refs);
+            struct H264DPBEntry *e = &dec->dpb[i];
+            if (e->is_long_term)
+                continue;
+            int pn = h264_pic_num(e, cur_frame_num, max_frame_num);
+            if (victim < 0 || pn < victim_pn) {
+                victim = i;
+                victim_pn = pn;
+            }
+        }
+        if (victim < 0)
+            break;                    /* only long-term refs left */
+        dec->dpb_used &= ~(1u << victim);
+        used--;
+    }
+}
+
+/* spec 8.2.5.4: adaptive memory control (MMCO ops 1-6) */
+static void h264_dpb_apply_mmco(LibVADecoder *dec, const struct H264Params *params,
+                                const struct H264SliceInfo *si, int cur_frame_num,
+                                int *cur_is_long_term, int *cur_lt_idx, int *had_mmco5) {
+    int max_frame_num = 1 << (params->log2_max_frame_num_minus4 + 4);
+    *had_mmco5 = 0;
+    for (int m = 0; m < si->n_mmco; m++) {
+        int op = si->mmco[m].op;
+        if (op == 1) {                /* unmark short-term */
+            int pic_num = cur_frame_num - (si->mmco[m].arg1 + 1);
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                const int i = __builtin_ctz(refs);
+                struct H264DPBEntry *e = &dec->dpb[i];
+                if (!e->is_long_term &&
+                    h264_pic_num(e, cur_frame_num, max_frame_num) == pic_num)
+                    dec->dpb_used &= ~(1u << i);
+            }
+        } else if (op == 2) {         /* unmark long-term by LongTermPicNum */
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                const int i = __builtin_ctz(refs);
+                struct H264DPBEntry *e = &dec->dpb[i];
+                if (e->is_long_term &&
+                    e->long_term_frame_idx == si->mmco[m].arg1)
+                    dec->dpb_used &= ~(1u << i);
+            }
+        } else if (op == 3) {         /* short-term -> long-term */
+            int pic_num = cur_frame_num - (si->mmco[m].arg1 + 1);
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                const int i = __builtin_ctz(refs);
+                struct H264DPBEntry *e = &dec->dpb[i];
+                if (e->is_long_term &&
+                    e->long_term_frame_idx == si->mmco[m].arg2)
+                    dec->dpb_used &= ~(1u << i);
+            }
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                struct H264DPBEntry *e = &dec->dpb[__builtin_ctz(refs)];
+                if (!e->is_long_term &&
+                    h264_pic_num(e, cur_frame_num, max_frame_num) == pic_num) {
+                    e->is_long_term = 1;
+                    e->long_term_frame_idx = si->mmco[m].arg2;
+                }
+            }
+        } else if (op == 4) {         /* max_long_term_frame_idx */
+            int max_idx = si->mmco[m].arg1 - 1;
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                const int i = __builtin_ctz(refs);
+                struct H264DPBEntry *e = &dec->dpb[i];
+                if (e->is_long_term && e->long_term_frame_idx > max_idx)
+                    dec->dpb_used &= ~(1u << i);
+            }
+        } else if (op == 5) {         /* unmark everything, reset numbering */
+            h264_dpb_flush(dec);
+            *had_mmco5 = 1;
+        } else if (op == 6) {         /* current picture becomes long-term */
+            for (uint32_t refs = dec->dpb_used; refs; refs &= refs - 1) {
+                const int i = __builtin_ctz(refs);
+                struct H264DPBEntry *e = &dec->dpb[i];
+                if (e->is_long_term &&
+                    e->long_term_frame_idx == si->mmco[m].arg2)
+                    dec->dpb_used &= ~(1u << i);
+            }
+            *cur_is_long_term = 1;
+            *cur_lt_idx = si->mmco[m].arg2;
+        }
+    }
+}
+
+static void h264_dpb_insert(LibVADecoder *dec, int surface_index,
+                            int frame_num, int top_foc, int bottom_foc,
+                            int is_long_term, int lt_idx) {
+    /* the slot IS the surface index (dpb[] is parallel to surfaces[]);
+     * its bit is clear by construction: the picker refuses surfaces
+     * that are still referenced or pinned */
+    struct H264DPBEntry *e = &dec->dpb[surface_index];
+    e->frame_num = frame_num;
+    e->top_foc = top_foc;
+    e->bottom_foc = bottom_foc;
+    e->is_long_term = is_long_term;
+    e->long_term_frame_idx = lt_idx;
+    dec->dpb_used |= 1u << surface_index;
+}
+
+static void h264_fill_va_picture(VAPictureH264 *p, const LibVADecoder *dec, int slot) {
+    const struct H264DPBEntry *e = &dec->dpb[slot];
+    p->picture_id = dec->surfaces[slot];
+    if (e->is_long_term) {
+        p->frame_idx = (uint32_t)e->long_term_frame_idx;
+        p->flags = VA_PICTURE_H264_LONG_TERM_REFERENCE;
+    } else {
+        p->frame_idx = (uint32_t)e->frame_num;
+        p->flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+    }
+    p->TopFieldOrderCnt = e->top_foc;
+    p->BottomFieldOrderCnt = e->bottom_foc;
+}
+
+/* RefPicList0 (spec 8.2.4.2.1 default order + 8.2.4.3 modification).
+ * Note the VDPAU-bridge driver ignores this list entirely (VDPAU
+ * re-derives it from the slice headers); it is filled correctly for
+ * VA drivers that do consume it.  Simplification vs spec: a picture
+ * appears at most once in the produced list. */
+static int h264_build_ref_list_l0(LibVADecoder *dec, const struct H264Params *params,
+                                  const struct H264SliceInfo *si,
+                                  struct H264DPBEntry **list, int max_out) {
+    int max_frame_num = 1 << (params->log2_max_frame_num_minus4 + 4);
+    int cur = si->frame_num;
+    int n = 0;
+    /* short-term references by descending PicNum */
+    for (uint32_t refs = dec->dpb_used; refs && n < max_out; refs &= refs - 1) {
+        struct H264DPBEntry *e = &dec->dpb[__builtin_ctz(refs)];
+        if (e->is_long_term)
+            continue;
+        int pn = h264_pic_num(e, cur, max_frame_num);
+        int j = n;
+        while (j > 0 && h264_pic_num(list[j - 1], cur, max_frame_num) < pn) {
+            list[j] = list[j - 1];
+            j--;
+        }
+        list[j] = e;
+        n++;
+    }
+    /* then long-term references by ascending LongTermFrameIdx */
+    int st_count = n;
+    for (uint32_t refs = dec->dpb_used; refs && n < max_out; refs &= refs - 1) {
+        struct H264DPBEntry *e = &dec->dpb[__builtin_ctz(refs)];
+        if (!e->is_long_term)
+            continue;
+        int j = n;
+        while (j > st_count && list[j - 1]->long_term_frame_idx > e->long_term_frame_idx) {
+            list[j] = list[j - 1];
+            j--;
+        }
+        list[j] = e;
+        n++;
+    }
+    if (si->n_ref_mod_l0 && n > 1) {
+        int pred = cur;               /* picNumL0Pred = CurrPicNum */
+        int ref_idx = 0;
+        for (int m = 0; m < si->n_ref_mod_l0 && ref_idx < n; m++) {
+            struct H264DPBEntry *target = NULL;
+            if (si->ref_mod_l0[m].idc <= 1) {
+                int abs_diff = si->ref_mod_l0[m].val + 1;
+                int nowrap;
+                if (si->ref_mod_l0[m].idc == 0) {
+                    nowrap = pred - abs_diff;
+                    if (nowrap < 0)
+                        nowrap += max_frame_num;
+                } else {
+                    nowrap = pred + abs_diff;
+                    if (nowrap >= max_frame_num)
+                        nowrap -= max_frame_num;
+                }
+                pred = nowrap;
+                int picnum = nowrap > cur ? nowrap - max_frame_num : nowrap;
+                for (int i = 0; i < n; i++) {
+                    if (!list[i]->is_long_term &&
+                        h264_pic_num(list[i], cur, max_frame_num) == picnum) {
+                        target = list[i];
+                        break;
+                    }
+                }
+            } else {                  /* idc == 2: long-term */
+                for (int i = 0; i < n; i++) {
+                    if (list[i]->is_long_term &&
+                        list[i]->long_term_frame_idx == si->ref_mod_l0[m].val) {
+                        target = list[i];
+                        break;
+                    }
+                }
+            }
+            if (!target)
+                continue;             /* unresolvable op in a broken stream */
+            int from = 0;
+            while (from < n && list[from] != target)
+                from++;
+            if (from >= n)
+                continue;
+            for (int i = from; i > ref_idx; i--)
+                list[i] = list[i - 1];
+            list[ref_idx] = target;
+            ref_idx++;
+        }
+    }
+    return n;
 }
 
 static void init_h264_weight_defaults(struct H264SliceInfo *si) {
@@ -1071,6 +1318,8 @@ static int parse_h264_slice_header(const uint8_t *slice, int size, int nal_type,
     si->first_mb = (int)br_ue(&br);
     si->slice_type = (int)br_ue(&br);
     slice_type_mod = si->slice_type % 5;
+    if (slice_type_mod == 1)
+        return 0;                     /* B slices: single-direction DPB only */
     pic_parameter_set_id = (int)br_ue(&br);
     if (pic_parameter_set_id != 0)
         return 0;
@@ -1088,7 +1337,7 @@ static int parse_h264_slice_header(const uint8_t *slice, int size, int nal_type,
     if (params->pic_order_cnt_type == 0) {
         si->poc_lsb = (int)br_bits(&br, params->log2_max_pic_order_cnt_lsb_minus4 + 4);
         if (params->pic_order_present_flag)
-            br_se(&br);               /* delta_pic_order_cnt_bottom */
+            si->delta_poc_bottom = br_se(&br);
     } else if (params->pic_order_cnt_type == 1 && !params->delta_pic_order_always_zero_flag) {
         br_se(&br);                   /* delta_pic_order_cnt[0] */
         if (params->pic_order_present_flag)
@@ -1098,24 +1347,21 @@ static int parse_h264_slice_header(const uint8_t *slice, int size, int nal_type,
         br_ue(&br);                   /* redundant_pic_cnt */
     si->num_ref_idx_l0_active_minus1 = params->num_ref_idx_l0_active_minus1;
     si->num_ref_idx_l1_active_minus1 = params->num_ref_idx_l1_active_minus1;
-    if (slice_type_mod == 1)
-        si->direct_spatial_mv_pred_flag = (int)br_bits(&br, 1);
-    if (slice_type_mod == 0 || slice_type_mod == 1 || slice_type_mod == 3) {
+    /* B slices were rejected above, so only P (0/3) can override, and
+     * only the L0 count exists in the bitstream */
+    if (slice_type_mod == 0 || slice_type_mod == 3) {
         int num_ref_idx_active_override_flag = (int)br_bits(&br, 1);
-        if (num_ref_idx_active_override_flag) {
+        if (num_ref_idx_active_override_flag)
             si->num_ref_idx_l0_active_minus1 = (int)br_ue(&br);
-            if (slice_type_mod == 1)
-                si->num_ref_idx_l1_active_minus1 = (int)br_ue(&br);
-        }
     }
-    if (!skip_h264_ref_pic_list_modification(&br, slice_type_mod))
+    if (!parse_h264_ref_pic_list_modification(&br, slice_type_mod, si))
         return 0;
-    if ((params->weighted_pred_flag && (slice_type_mod == 0 || slice_type_mod == 3)) ||
-        (params->weighted_bipred_idc == 1 && slice_type_mod == 1))
+    if (params->weighted_pred_flag && (slice_type_mod == 0 || slice_type_mod == 3))
         parse_h264_pred_weight_table(&br, params, si);
     else
         init_h264_weight_defaults(si);
-    skip_h264_dec_ref_pic_marking(&br, nal_type, si->nal_ref_idc);
+    if (!parse_h264_dec_ref_pic_marking(&br, nal_type, si))
+        return 0;
     if (params->entropy_coding_mode_flag && slice_type_mod != 2 && slice_type_mod != 4)
         si->cabac_init_idc = (int)br_ue(&br);
     si->slice_qp_delta = br_se(&br);
@@ -1161,990 +1407,15 @@ static int collect_h264_slices(const uint8_t *data, int size, const struct H264P
     return count;
 }
 
-static int ensure_plane(LibVADecoder *dec, int plane, size_t size) {
-    uint8_t *p;
-    if (dec->plane_caps[plane] >= size)
-        return 1;
-    p = (uint8_t *)realloc(dec->planes[plane], size);
-    if (!p) {
-        snprintf(dec->last_error, sizeof(dec->last_error), "failed to allocate decoded plane %d", plane);
-        return 0;
-    }
-    dec->planes[plane] = p;
-    dec->plane_caps[plane] = size;
-    return 1;
-}
+typedef int (*vdpau_va_export_v1_fn)(VADisplay, VASurfaceID,
+                                     uintptr_t *, void **, uint32_t *);
 
-static LibVADecodeStatus map_output(LibVADecoder *dec, VASurfaceID surface,
-                                    LibVADecodedFrame *frame) {
-    VAImage image;
-    VAStatus status;
-    void *data = NULL;
-    long long t0, t1, t2;
-    int w = dec->width;
-    int h = dec->height;
-
-    t0 = usec_now();
-    status = vaDeriveImage(dec->display, surface, &image);
-    if (status != VA_STATUS_SUCCESS)
-        return set_error(dec, status, "vaDeriveImage");
-    status = vaMapBuffer(dec->display, image.buf, &data);
-    t1 = usec_now();
-    if (status != VA_STATUS_SUCCESS) {
-        vaDestroyImage(dec->display, image.image_id);
-        return set_error(dec, status, "vaMapBuffer(output)");
-    }
-
-    memset(frame, 0, sizeof(*frame));
-    frame->full_range = dec->full_range;
-    frame->width = w;
-    frame->height = h;
-    frame->depth = dec->output_444 ? 24 : 24;
-    if (image.format.fourcc == VA_FOURCC_NV12) {
-        size_t ysize = (size_t)w * h;
-        size_t uvsize = (size_t)w * ((h + 1) / 2);
-        if (!ensure_plane(dec, 0, ysize) || !ensure_plane(dec, 1, uvsize)) {
-            vaUnmapBuffer(dec->display, image.buf);
-            vaDestroyImage(dec->display, image.image_id);
-            return LIBVA_DEC_ERROR;
-        }
-        for (int row = 0; row < h; row++)
-            memcpy(dec->planes[0] + (size_t)row * w,
-                   (uint8_t *)data + image.offsets[0] + (size_t)row * image.pitches[0], w);
-        for (int row = 0; row < (h + 1) / 2; row++)
-            memcpy(dec->planes[1] + (size_t)row * w,
-                   (uint8_t *)data + image.offsets[1] + (size_t)row * image.pitches[1], w);
-        frame->planes[0] = dec->planes[0];
-        frame->planes[1] = dec->planes[1];
-        frame->strides[0] = w;
-        frame->strides[1] = w;
-        frame->sizes[0] = (int)ysize;
-        frame->sizes[1] = (int)uvsize;
-        frame->nplanes = 2;
-        frame->bytes_per_pixel = 1;
-        frame->format = LIBVA_DEC_FMT_NV12;
-    } else if (image.format.fourcc == VA_FOURCC_444P) {
-        size_t psize = (size_t)w * h;
-        for (int p = 0; p < 3; p++) {
-            if (!ensure_plane(dec, p, psize)) {
-                vaUnmapBuffer(dec->display, image.buf);
-                vaDestroyImage(dec->display, image.image_id);
-                return LIBVA_DEC_ERROR;
-            }
-            for (int row = 0; row < h; row++)
-                memcpy(dec->planes[p] + (size_t)row * w,
-                       (uint8_t *)data + image.offsets[p] + (size_t)row * image.pitches[p], w);
-            frame->planes[p] = dec->planes[p];
-            frame->strides[p] = w;
-            frame->sizes[p] = (int)psize;
-        }
-        frame->nplanes = 3;
-        frame->bytes_per_pixel = 1;
-        frame->format = LIBVA_DEC_FMT_YUV444P;
-    } else if (image.format.fourcc == VA_FOURCC_XYUV || image.format.fourcc == VA_FOURCC_AYUV) {
-        int stride = w * 4;
-        size_t psize = (size_t)stride * h;
-        if (!ensure_plane(dec, 0, psize)) {
-            vaUnmapBuffer(dec->display, image.buf);
-            vaDestroyImage(dec->display, image.image_id);
-            return LIBVA_DEC_ERROR;
-        }
-        for (int row = 0; row < h; row++)
-            memcpy(dec->planes[0] + (size_t)row * stride,
-                   (uint8_t *)data + image.offsets[0] + (size_t)row * image.pitches[0], stride);
-        frame->planes[0] = dec->planes[0];
-        frame->strides[0] = stride;
-        frame->sizes[0] = (int)psize;
-        frame->nplanes = 1;
-        frame->depth = 32;
-        frame->bytes_per_pixel = 4;
-        frame->format = image.format.fourcc == VA_FOURCC_XYUV ? LIBVA_DEC_FMT_XYUV : LIBVA_DEC_FMT_AYUV;
-    } else {
-        snprintf(dec->last_error, sizeof(dec->last_error), "unsupported VA output fourcc %s (%#x)",
-                 fourcc_name(image.format.fourcc), image.format.fourcc);
-        vaUnmapBuffer(dec->display, image.buf);
-        vaDestroyImage(dec->display, image.image_id);
-        return LIBVA_DEC_UNSUPPORTED;
-    }
-    vaUnmapBuffer(dec->display, image.buf);
-    vaDestroyImage(dec->display, image.image_id);
-    t2 = usec_now();
-    frame->us_map = (int)(t1 - t0);
-    frame->us_copy = (int)(t2 - t1);
-    return LIBVA_DEC_OK;
-}
-
-static void init_vp8_state(struct VP8State *state) {
-    static const uint8_t nk_y[4] = {112, 86, 140, 37};
-    static const uint8_t nk_uv[3] = {162, 101, 204};
-    memset(state, 0, sizeof(*state));
-    memcpy(state->token_probs, vp8_default_token_probs, sizeof(state->token_probs));
-    memcpy(state->mv_probs, vp8_default_mv_probs, sizeof(state->mv_probs));
-    memcpy(state->y_mode_probs, nk_y, sizeof(state->y_mode_probs));
-    memcpy(state->uv_mode_probs, nk_uv, sizeof(state->uv_mode_probs));
-}
-
-static void vp8_bool_fill(struct VP8BoolReader *br) {
-    int shift = 16 - br->count;
-    while (shift >= 0 && br->pos < br->size) {
-        br->value |= (unsigned int)br->data[br->pos++] << shift;
-        br->count += 8;
-        shift -= 8;
-    }
-    if (shift >= 0)
-        br->count += 0x40000000;
-}
-
-static void vp8_bool_init(struct VP8BoolReader *br, const uint8_t *data, int size) {
-    memset(br, 0, sizeof(*br));
-    br->data = data;
-    br->size = size;
-    br->range = 255;
-    br->count = -8;
-    vp8_bool_fill(br);
-}
-
-static int vp8_norm_shift(unsigned int range) {
-    int shift = 0;
-    while (range < 128) {
-        range <<= 1;
-        shift++;
-    }
-    return shift;
-}
-
-static int vp8_bool_read(struct VP8BoolReader *br, int probability) {
-    unsigned int split = 1 + (((br->range - 1) * (unsigned int)probability) >> 8);
-    unsigned int bigsplit = split << 24;
-    int bit = 0;
-    int shift;
-    if (br->count < 0)
-        vp8_bool_fill(br);
-    if (br->value >= bigsplit) {
-        br->range -= split;
-        br->value -= bigsplit;
-        bit = 1;
-    } else {
-        br->range = split;
-    }
-    shift = vp8_norm_shift(br->range);
-    br->range <<= shift;
-    br->value <<= shift;
-    br->count -= shift;
-    return bit;
-}
-
-static int vp8_bool_bits(struct VP8BoolReader *br, int bits) {
-    int v = 0;
-    for (int i = bits - 1; i >= 0; i--)
-        v |= vp8_bool_read(br, 128) << i;
-    return v;
-}
-
-static int vp8_bool_sint(struct VP8BoolReader *br, int bits) {
-    int v = vp8_bool_bits(br, bits);
-    return vp8_bool_read(br, 128) ? -v : v;
-}
-
-static int vp8_bool_pos(const struct VP8BoolReader *br) {
-    return br->pos * 8 - (8 + br->count);
-}
-
-static void vp8_bool_state(struct VP8BoolReader *br, VABoolCoderContextVPX *ctx) {
-    if (br->count < 0)
-        vp8_bool_fill(br);
-    ctx->range = (uint8_t)br->range;
-    ctx->value = (uint8_t)(br->value >> 24);
-    ctx->count = (uint8_t)((8 + br->count) & 7);
-}
-
-static void vp8_parse_segmentation(struct VP8BoolReader *br, struct VP8State *state) {
-    state->update_mb_segmentation_map = 0;
-    state->update_segment_feature_data = 0;
-    if (!vp8_bool_read(br, 128)) {
-        state->segmentation_enabled = 0;
-        return;
-    }
-    state->segmentation_enabled = 1;
-    state->update_mb_segmentation_map = vp8_bool_read(br, 128);
-    state->update_segment_feature_data = vp8_bool_read(br, 128);
-    if (state->update_segment_feature_data) {
-        state->segment_feature_mode = vp8_bool_read(br, 128);
-        for (int i = 0; i < 4; i++)
-            state->quantizer_update_value[i] = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 7) : 0;
-        for (int i = 0; i < 4; i++)
-            state->lf_update_value[i] = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 6) : 0;
-    }
-    if (state->update_mb_segmentation_map) {
-        for (int i = 0; i < 3; i++)
-            state->segment_prob[i] = vp8_bool_read(br, 128) ? (uint8_t)vp8_bool_bits(br, 8) : 255;
-    }
-}
-
-static void vp8_parse_lf_adjust(struct VP8BoolReader *br, struct VP8State *state) {
-    state->mode_ref_lf_delta_update = 0;
-    state->loop_filter_adj_enable = vp8_bool_read(br, 128);
-    if (!state->loop_filter_adj_enable)
-        return;
-    state->mode_ref_lf_delta_update = vp8_bool_read(br, 128);
-    if (!state->mode_ref_lf_delta_update)
-        return;
-    for (int i = 0; i < 4; i++)
-        if (vp8_bool_read(br, 128))
-            state->ref_frame_delta[i] = vp8_bool_sint(br, 6);
-    for (int i = 0; i < 4; i++)
-        if (vp8_bool_read(br, 128))
-            state->mb_mode_delta[i] = vp8_bool_sint(br, 6);
-}
-
-static void vp8_parse_quant(struct VP8BoolReader *br, struct VP8FrameInfo *info) {
-    info->y_ac_qi = vp8_bool_bits(br, 7);
-    info->y_dc_delta = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 4) : 0;
-    info->y2_dc_delta = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 4) : 0;
-    info->y2_ac_delta = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 4) : 0;
-    info->uv_dc_delta = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 4) : 0;
-    info->uv_ac_delta = vp8_bool_read(br, 128) ? vp8_bool_sint(br, 4) : 0;
-}
-
-static int parse_vp8_frame(LibVADecoder *dec, const uint8_t *data, int size,
-                           struct VP8FrameInfo *info) {
-    static const uint8_t kf_y[4] = {145, 156, 163, 128};
-    static const uint8_t kf_uv[3] = {142, 114, 183};
-    uint32_t tag;
-    const uint8_t *part0;
-    int part0_size;
-    struct VP8BoolReader br;
-    if (size < 3)
-        return 0;
-    memset(info, 0, sizeof(*info));
-    tag = (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16);
-    info->key_frame = !(tag & 1);
-    info->version = (tag >> 1) & 7;
-    info->show_frame = (tag >> 4) & 1;
-    info->first_part_size = (tag >> 5) & 0x7ffff;
-    info->data_chunk_size = info->key_frame ? 10 : 3;
-    if (info->data_chunk_size >= size || info->first_part_size <= 0)
-        return 0;
-    if (info->key_frame) {
-        if (size < 10 || data[3] != 0x9d || data[4] != 0x01 || data[5] != 0x2a)
-            return 0;
-        info->width = (int)(data[6] | (data[7] << 8)) & 0x3fff;
-        info->height = (int)(data[8] | (data[9] << 8)) & 0x3fff;
-        init_vp8_state(dec->vp8_state);
-    }
-    info->probs = *dec->vp8_state;
-    part0 = data + info->data_chunk_size;
-    part0_size = info->first_part_size;
-    if (info->data_chunk_size + part0_size > size)
-        return 0;
-    vp8_bool_init(&br, part0, part0_size);
-    if (info->key_frame) {
-        vp8_bool_bits(&br, 1);         /* color_space */
-        vp8_bool_bits(&br, 1);         /* clamping_type */
-    }
-    vp8_parse_segmentation(&br, &info->probs);
-    info->filter_type = vp8_bool_bits(&br, 1);
-    info->loop_filter_level = vp8_bool_bits(&br, 6);
-    info->sharpness_level = vp8_bool_bits(&br, 3);
-    vp8_parse_lf_adjust(&br, &info->probs);
-    info->log2_partitions = vp8_bool_bits(&br, 2);
-    vp8_parse_quant(&br, info);
-    if (info->key_frame) {
-        info->refresh_entropy_probs = vp8_bool_read(&br, 128);
-        info->refresh_last = 1;
-        info->refresh_golden_frame = 1;
-        info->refresh_alternate_frame = 1;
-        memcpy(info->probs.y_mode_probs, kf_y, sizeof(kf_y));
-        memcpy(info->probs.uv_mode_probs, kf_uv, sizeof(kf_uv));
-    } else {
-        info->refresh_golden_frame = vp8_bool_read(&br, 128);
-        info->refresh_alternate_frame = vp8_bool_read(&br, 128);
-        if (!info->refresh_golden_frame)
-            info->copy_buffer_to_golden = vp8_bool_bits(&br, 2);
-        if (!info->refresh_alternate_frame)
-            info->copy_buffer_to_alternate = vp8_bool_bits(&br, 2);
-        info->sign_bias_golden = vp8_bool_bits(&br, 1);
-        info->sign_bias_alternate = vp8_bool_bits(&br, 1);
-        info->refresh_entropy_probs = vp8_bool_read(&br, 128);
-        info->refresh_last = vp8_bool_read(&br, 128);
-    }
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 8; j++)
-            for (int k = 0; k < 3; k++)
-                for (int l = 0; l < 11; l++)
-                    if (vp8_bool_read(&br, vp8_token_update_probs[i][j][k][l]))
-                        info->probs.token_probs[i][j][k][l] = (uint8_t)vp8_bool_bits(&br, 8);
-    info->mb_no_coeff_skip = vp8_bool_read(&br, 128);
-    if (info->mb_no_coeff_skip)
-        info->prob_skip_false = vp8_bool_bits(&br, 8);
-    if (!info->key_frame) {
-        info->prob_intra = vp8_bool_bits(&br, 8);
-        info->prob_last = vp8_bool_bits(&br, 8);
-        info->prob_gf = vp8_bool_bits(&br, 8);
-        if (vp8_bool_read(&br, 128))
-            for (int i = 0; i < 4; i++)
-                info->probs.y_mode_probs[i] = (uint8_t)vp8_bool_bits(&br, 8);
-        if (vp8_bool_read(&br, 128))
-            for (int i = 0; i < 3; i++)
-                info->probs.uv_mode_probs[i] = (uint8_t)vp8_bool_bits(&br, 8);
-        for (int i = 0; i < 2; i++)
-            for (int j = 0; j < 19; j++)
-                if (vp8_bool_read(&br, vp8_mv_update_probs[i][j])) {
-                    int prob = vp8_bool_bits(&br, 7);
-                    info->probs.mv_probs[i][j] = (uint8_t)(prob ? (prob << 1) : 1);
-                }
-    }
-    info->header_bits = vp8_bool_pos(&br);
-    info->bool_state = br;
-    int n_parts = 1 << info->log2_partitions;
-    int offset = info->data_chunk_size + info->first_part_size + 3 * (n_parts - 1);
-    if (offset > size)
-        return 0;
-    for (int i = 0; i < n_parts - 1; i++) {
-        const uint8_t *p = data + info->data_chunk_size + info->first_part_size + 3 * i;
-        info->partition_size[i + 1] = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-        offset += (int)info->partition_size[i + 1];
-    }
-    if (offset > size)
-        return 0;
-    info->partition_size[n_parts] = (uint32_t)(size - offset);
-    if (info->refresh_entropy_probs)
-        *dec->vp8_state = info->probs;
-    return 1;
-}
-
-static VASurfaceID vpx_ref_surface(LibVADecoder *dec, int index) {
-    return index >= 0 ? dec->surfaces[index & 3] : VA_INVALID_SURFACE;
-}
-
-static void fill_vp8_iq(const struct VP8FrameInfo *info, VAIQMatrixBufferVP8 *iq) {
-    memset(iq, 0, sizeof(*iq));
-    for (int i = 0; i < 4; i++) {
-        int base = info->probs.segmentation_enabled ? info->probs.quantizer_update_value[i] : info->y_ac_qi;
-        if (info->probs.segmentation_enabled && !info->probs.segment_feature_mode)
-            base += info->y_ac_qi;
-        iq->quantization_index[i][0] = (uint16_t)clamp_int(base, 0, 127);
-        iq->quantization_index[i][1] = (uint16_t)clamp_int(base + info->y_dc_delta, 0, 127);
-        iq->quantization_index[i][2] = (uint16_t)clamp_int(base + info->y2_dc_delta, 0, 127);
-        iq->quantization_index[i][3] = (uint16_t)clamp_int(base + info->y2_ac_delta, 0, 127);
-        iq->quantization_index[i][4] = (uint16_t)clamp_int(base + info->uv_dc_delta, 0, 127);
-        iq->quantization_index[i][5] = (uint16_t)clamp_int(base + info->uv_ac_delta, 0, 127);
-    }
-}
-
-static LibVADecodeStatus vp8_decoder_decode(LibVADecoder *dec,
-                                            const uint8_t *data, int data_len,
-                                            LibVADecodedFrame *frame) {
-    VABufferID buffers[5];
-    int nbuf = 0;
-    struct VP8FrameInfo info;
-    VAPictureParameterBufferVP8 pic;
-    VAProbabilityDataBufferVP8 prob;
-    VAIQMatrixBufferVP8 iq;
-    VASliceParameterBufferVP8 slice;
-    int surface_index;
-    VASurfaceID surface;
-    VAStatus status;
-    LibVADecodeStatus dstatus;
-    long long t0, t1, t2;
-
-    if (!parse_vp8_frame(dec, data, data_len, &info))
-        return set_message(dec, LIBVA_DEC_UNSUPPORTED, "unsupported VP8 frame header");
-    for (int i = 0; i < (int)(sizeof(buffers) / sizeof(buffers[0])); i++)
-        buffers[i] = VA_INVALID_ID;
-    surface_index = dec->surface_index++ & 3;
-    surface = dec->surfaces[surface_index];
-
-    memset(&pic, 0, sizeof(pic));
-    pic.frame_width = (uint32_t)dec->width;
-    pic.frame_height = (uint32_t)dec->height;
-    pic.last_ref_frame = vpx_ref_surface(dec, dec->vpx_last_surface);
-    pic.golden_ref_frame = vpx_ref_surface(dec, dec->vpx_golden_surface);
-    pic.alt_ref_frame = vpx_ref_surface(dec, dec->vpx_alt_surface);
-    pic.out_of_loop_frame = VA_INVALID_SURFACE;
-    pic.pic_fields.bits.key_frame = !info.key_frame;
-    pic.pic_fields.bits.version = (uint32_t)info.version;
-    pic.pic_fields.bits.segmentation_enabled = (uint32_t)info.probs.segmentation_enabled;
-    pic.pic_fields.bits.update_mb_segmentation_map = (uint32_t)info.probs.update_mb_segmentation_map;
-    pic.pic_fields.bits.update_segment_feature_data = (uint32_t)info.probs.update_segment_feature_data;
-    pic.pic_fields.bits.filter_type = (uint32_t)info.filter_type;
-    pic.pic_fields.bits.sharpness_level = (uint32_t)info.sharpness_level;
-    pic.pic_fields.bits.loop_filter_adj_enable = (uint32_t)info.probs.loop_filter_adj_enable;
-    pic.pic_fields.bits.mode_ref_lf_delta_update = (uint32_t)info.probs.mode_ref_lf_delta_update;
-    pic.pic_fields.bits.sign_bias_golden = (uint32_t)info.sign_bias_golden;
-    pic.pic_fields.bits.sign_bias_alternate = (uint32_t)info.sign_bias_alternate;
-    pic.pic_fields.bits.mb_no_coeff_skip = (uint32_t)info.mb_no_coeff_skip;
-    pic.pic_fields.bits.loop_filter_disable = (uint32_t)(info.loop_filter_level == 0);
-    memcpy(pic.mb_segment_tree_probs, info.probs.segment_prob, sizeof(pic.mb_segment_tree_probs));
-    for (int i = 0; i < 4; i++) {
-        int level = info.probs.segmentation_enabled ? info.probs.lf_update_value[i] : info.loop_filter_level;
-        if (info.probs.segmentation_enabled && !info.probs.segment_feature_mode)
-            level += info.loop_filter_level;
-        pic.loop_filter_level[i] = (uint8_t)clamp_int(level, 0, 63);
-        pic.loop_filter_deltas_ref_frame[i] = (int8_t)info.probs.ref_frame_delta[i];
-        pic.loop_filter_deltas_mode[i] = (int8_t)info.probs.mb_mode_delta[i];
-    }
-    pic.prob_skip_false = (uint8_t)info.prob_skip_false;
-    pic.prob_intra = (uint8_t)info.prob_intra;
-    pic.prob_last = (uint8_t)info.prob_last;
-    pic.prob_gf = (uint8_t)info.prob_gf;
-    memcpy(pic.y_mode_probs, info.probs.y_mode_probs, sizeof(pic.y_mode_probs));
-    memcpy(pic.uv_mode_probs, info.probs.uv_mode_probs, sizeof(pic.uv_mode_probs));
-    memcpy(pic.mv_probs, info.probs.mv_probs, sizeof(pic.mv_probs));
-    vp8_bool_state(&info.bool_state, &pic.bool_coder_ctx);
-
-    memset(&prob, 0, sizeof(prob));
-    memcpy(prob.dct_coeff_probs, info.probs.token_probs, sizeof(prob.dct_coeff_probs));
-    fill_vp8_iq(&info, &iq);
-    memset(&slice, 0, sizeof(slice));
-    slice.slice_data_size = (uint32_t)data_len;
-    slice.slice_data_offset = (uint32_t)info.data_chunk_size;
-    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
-    slice.macroblock_offset = (uint32_t)info.header_bits;
-    slice.num_of_partitions = (uint8_t)((1 << info.log2_partitions) + 1);
-    slice.partition_size[0] = (uint32_t)(info.first_part_size - ((info.header_bits + 7) >> 3));
-    for (int i = 1; i < slice.num_of_partitions && i < 9; i++)
-        slice.partition_size[i] = info.partition_size[i];
-
-    status = vaCreateBuffer(dec->display, dec->context, VAPictureParameterBufferType,
-                            sizeof(pic), 1, &pic, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VAProbabilityBufferType,
-                                sizeof(prob), 1, &prob, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VAIQMatrixBufferType,
-                                sizeof(iq), 1, &iq, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VASliceParameterBufferType,
-                                sizeof(slice), 1, &slice, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VASliceDataBufferType,
-                                (unsigned int)data_len, 1, (void *)data, &buffers[nbuf++]);
-    if (status != VA_STATUS_SUCCESS) {
-        destroy_buffers(dec, buffers, nbuf);
-        return set_error(dec, status, "vaCreateBuffer(VP8)");
-    }
-
-    t0 = usec_now();
-    status = vaBeginPicture(dec->display, dec->context, surface);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaRenderPicture(dec->display, dec->context, buffers, nbuf);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaEndPicture(dec->display, dec->context);
-    t1 = usec_now();
-    destroy_buffers(dec, buffers, nbuf);
-    if (status != VA_STATUS_SUCCESS)
-        return set_error(dec, status, "VA VP8 decode submit");
-    status = vaSyncSurface(dec->display, surface);
-    t2 = usec_now();
-    if (status != VA_STATUS_SUCCESS)
-        return set_error(dec, status, "vaSyncSurface");
-    dstatus = map_output(dec, surface, frame);
-    if (dstatus != LIBVA_DEC_OK)
-        return dstatus;
-    if (info.copy_buffer_to_golden == 1)
-        dec->vpx_golden_surface = dec->vpx_last_surface;
-    else if (info.copy_buffer_to_golden == 2)
-        dec->vpx_golden_surface = dec->vpx_alt_surface;
-    if (info.copy_buffer_to_alternate == 1)
-        dec->vpx_alt_surface = dec->vpx_last_surface;
-    else if (info.copy_buffer_to_alternate == 2)
-        dec->vpx_alt_surface = dec->vpx_golden_surface;
-    if (info.refresh_golden_frame)
-        dec->vpx_golden_surface = surface_index;
-    if (info.refresh_alternate_frame)
-        dec->vpx_alt_surface = surface_index;
-    if (info.refresh_last || info.key_frame)
-        dec->vpx_last_surface = surface_index;
-    frame->us_submit = (int)(t1 - t0);
-    frame->us_sync = (int)(t2 - t1);
-    dec->frames++;
-    return LIBVA_DEC_OK;
-}
-
-static void vp9_br_init(struct VP9BitReader *br, const uint8_t *data, int size) {
-    br->data = data;
-    br->size = size;
-    br->bit_pos = 0;
-}
-
-static int vp9_bit(struct VP9BitReader *br) {
-    int pos = br->bit_pos++;
-    if (pos >= br->size * 8)
-        return 0;
-    return (br->data[pos >> 3] >> (7 - (pos & 7))) & 1;
-}
-
-static int vp9_bits(struct VP9BitReader *br, int bits) {
-    int v = 0;
-    for (int i = 0; i < bits; i++)
-        v = (v << 1) | vp9_bit(br);
-    return v;
-}
-
-static int vp9_sbits(struct VP9BitReader *br, int bits) {
-    int v = vp9_bits(br, bits);
-    return vp9_bit(br) ? -v : v;
-}
-
-static int vp9_read_delta_q(struct VP9BitReader *br) {
-    return vp9_bit(br) ? vp9_sbits(br, 4) : 0;
-}
-
-static int vp9_read_profile(struct VP9BitReader *br) {
-    int profile = vp9_bit(br);
-    profile |= vp9_bit(br) << 1;
-    if (profile > 2)
-        vp9_bit(br);
-    return profile;
-}
-
-static int vp9_read_sync_code(struct VP9BitReader *br) {
-    return vp9_bits(br, 8) == 0x49 && vp9_bits(br, 8) == 0x83 && vp9_bits(br, 8) == 0x42;
-}
-
-static void vp9_read_frame_size(struct VP9BitReader *br, int *w, int *h) {
-    *w = vp9_bits(br, 16) + 1;
-    *h = vp9_bits(br, 16) + 1;
-}
-
-static void vp9_read_render_size(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    if (vp9_bit(br))
-        vp9_read_frame_size(br, &info->render_width, &info->render_height);
-    else {
-        info->render_width = info->frame_width;
-        info->render_height = info->frame_height;
-    }
-}
-
-static int vp9_read_color_config(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    int color_space;
-    info->bit_depth = 8;
-    info->subsampling_x = 1;
-    info->subsampling_y = 1;
-    if (info->profile >= 2)
-        info->bit_depth = vp9_bit(br) ? 12 : 10;
-    color_space = vp9_bits(br, 3);
-    if (color_space != 7) {
-        info->color_range = vp9_bit(br);   /* 0=studio, 1=full */
-        if (info->profile == 1 || info->profile == 3) {
-            info->subsampling_x = vp9_bit(br);
-            info->subsampling_y = vp9_bit(br);
-            vp9_bit(br);              /* reserved */
-        }
-    } else if (info->profile == 1 || info->profile == 3) {
-        info->color_range = 1;             /* CS_RGB (sRGB) is always full range */
-        info->subsampling_x = 0;
-        info->subsampling_y = 0;
-        vp9_bit(br);                  /* reserved */
-    } else {
-        return 0;
-    }
-    return 1;
-}
-
-static void vp9_init_lf_deltas(struct VP9FrameInfo *info) {
-    info->loop_filter_ref_deltas[0] = 1;
-    info->loop_filter_ref_deltas[1] = 0;
-    info->loop_filter_ref_deltas[2] = -1;
-    info->loop_filter_ref_deltas[3] = -1;
-    info->loop_filter_mode_deltas[0] = 0;
-    info->loop_filter_mode_deltas[1] = 0;
-}
-
-static void init_vp9_state(LibVADecoder *dec) {
-    dec->vp9_bit_depth = 8;
-    dec->vp9_subsampling_x = 1;
-    dec->vp9_subsampling_y = 1;
-    dec->vp9_loop_filter_ref_deltas[0] = 1;
-    dec->vp9_loop_filter_ref_deltas[1] = 0;
-    dec->vp9_loop_filter_ref_deltas[2] = -1;
-    dec->vp9_loop_filter_ref_deltas[3] = -1;
-    dec->vp9_loop_filter_mode_deltas[0] = 0;
-    dec->vp9_loop_filter_mode_deltas[1] = 0;
-    dec->vp9_segmentation_abs_or_delta_update = 0;
-    memset(dec->vp9_feature_enabled, 0, sizeof(dec->vp9_feature_enabled));
-    memset(dec->vp9_feature_data, 0, sizeof(dec->vp9_feature_data));
-}
-
-static void load_vp9_state(LibVADecoder *dec, struct VP9FrameInfo *info) {
-    /* color_config (bit depth / chroma subsampling) is only signalled in key and
-     * intra-only frames; inter frames inherit it from the previous decoded frame. */
-    info->bit_depth = dec->vp9_bit_depth;
-    info->color_range = dec->vp9_color_range;
-    info->subsampling_x = dec->vp9_subsampling_x;
-    info->subsampling_y = dec->vp9_subsampling_y;
-    memcpy(info->loop_filter_ref_deltas, dec->vp9_loop_filter_ref_deltas,
-           sizeof(info->loop_filter_ref_deltas));
-    memcpy(info->loop_filter_mode_deltas, dec->vp9_loop_filter_mode_deltas,
-           sizeof(info->loop_filter_mode_deltas));
-    info->segmentation_abs_or_delta_update = dec->vp9_segmentation_abs_or_delta_update;
-    memcpy(info->feature_enabled, dec->vp9_feature_enabled, sizeof(info->feature_enabled));
-    memcpy(info->feature_data, dec->vp9_feature_data, sizeof(info->feature_data));
-}
-
-static void save_vp9_state(LibVADecoder *dec, const struct VP9FrameInfo *info) {
-    dec->vp9_bit_depth = info->bit_depth;
-    dec->vp9_color_range = info->color_range;
-    dec->full_range = info->color_range;
-    dec->vp9_subsampling_x = info->subsampling_x;
-    dec->vp9_subsampling_y = info->subsampling_y;
-    memcpy(dec->vp9_loop_filter_ref_deltas, info->loop_filter_ref_deltas,
-           sizeof(dec->vp9_loop_filter_ref_deltas));
-    memcpy(dec->vp9_loop_filter_mode_deltas, info->loop_filter_mode_deltas,
-           sizeof(dec->vp9_loop_filter_mode_deltas));
-    if (info->segmentation_enabled) {
-        dec->vp9_segmentation_abs_or_delta_update = info->segmentation_abs_or_delta_update;
-        memcpy(dec->vp9_feature_enabled, info->feature_enabled, sizeof(dec->vp9_feature_enabled));
-        memcpy(dec->vp9_feature_data, info->feature_data, sizeof(dec->vp9_feature_data));
-    }
-}
-
-static void vp9_read_loop_filter(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    info->loop_filter_level = vp9_bits(br, 6);
-    info->loop_filter_sharpness = vp9_bits(br, 3);
-    info->loop_filter_delta_enabled = vp9_bit(br);
-    if (info->loop_filter_delta_enabled && vp9_bit(br)) {
-        for (int i = 0; i < 4; i++)
-            if (vp9_bit(br))
-                info->loop_filter_ref_deltas[i] = vp9_sbits(br, 6);
-        for (int i = 0; i < 2; i++)
-            if (vp9_bit(br))
-                info->loop_filter_mode_deltas[i] = vp9_sbits(br, 6);
-    }
-}
-
-static void vp9_read_quant(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    info->base_q_idx = vp9_bits(br, 8);
-    info->delta_q_y_dc = vp9_read_delta_q(br);
-    info->delta_q_uv_dc = vp9_read_delta_q(br);
-    info->delta_q_uv_ac = vp9_read_delta_q(br);
-    info->lossless = info->base_q_idx == 0 && info->delta_q_y_dc == 0 &&
-                     info->delta_q_uv_dc == 0 && info->delta_q_uv_ac == 0;
-}
-
-static int vp9_seg_signed(int feature) {
-    return feature == 0 || feature == 1;
-}
-
-static int vp9_seg_bits(int feature) {
-    static const int bits[4] = {8, 6, 2, 0};
-    return bits[feature];
-}
-
-static void vp9_read_segmentation(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    info->segmentation_enabled = vp9_bit(br);
-    if (!info->segmentation_enabled)
-        return;
-    info->segmentation_update_map = vp9_bit(br);
-    if (info->segmentation_update_map) {
-        for (int i = 0; i < 7; i++)
-            info->segmentation_tree_probs[i] = vp9_bit(br) ? (uint8_t)vp9_bits(br, 8) : 255;
-        info->segmentation_temporal_update = vp9_bit(br);
-        if (info->segmentation_temporal_update) {
-            for (int i = 0; i < 3; i++)
-                info->segmentation_pred_probs[i] = vp9_bit(br) ? (uint8_t)vp9_bits(br, 8) : 255;
-        } else {
-            memset(info->segmentation_pred_probs, 255, sizeof(info->segmentation_pred_probs));
-        }
-    }
-    if (vp9_bit(br)) {
-        info->segmentation_abs_or_delta_update = vp9_bit(br);
-        for (int i = 0; i < 8; i++) {
-            for (int j = 0; j < 4; j++) {
-                info->feature_enabled[i][j] = vp9_bit(br);
-                if (info->feature_enabled[i][j]) {
-                    info->feature_data[i][j] = vp9_bits(br, vp9_seg_bits(j));
-                    if (vp9_seg_signed(j) && vp9_bit(br))
-                        info->feature_data[i][j] = -info->feature_data[i][j];
-                }
-            }
-        }
-    }
-}
-
-static void vp9_read_tiles(struct VP9BitReader *br, struct VP9FrameInfo *info) {
-    int sb64_cols = (info->frame_width + 63) / 64;
-    int min_log2 = 0, max_log2 = 0;
-    while ((64 << min_log2) < sb64_cols)
-        min_log2++;
-    while ((sb64_cols >> max_log2) >= 4)
-        max_log2++;
-    info->tile_cols_log2 = min_log2;
-    while (info->tile_cols_log2 < max_log2 && vp9_bit(br))
-        info->tile_cols_log2++;
-    info->tile_rows_log2 = vp9_bit(br);
-    if (info->tile_rows_log2)
-        info->tile_rows_log2 += vp9_bit(br);
-}
-
-static int parse_vp9_frame(LibVADecoder *dec, const uint8_t *data, int size,
-                           struct VP9FrameInfo *info) {
-    struct VP9BitReader br;
-    int marker;
-    memset(info, 0, sizeof(*info));
-    load_vp9_state(dec, info);
-    vp9_br_init(&br, data, size);
-    marker = vp9_bits(&br, 2);
-    if (marker != 2)
-        return 0;
-    info->profile = vp9_read_profile(&br);
-    if (info->profile > 1 && !dec->output_444)
-        return 0;
-    if (vp9_bit(&br)) {               /* show_existing_frame */
-        int ref = vp9_bits(&br, 3);
-        (void)ref;
-        return 0;
-    }
-    info->frame_type = vp9_bit(&br);
-    info->show_frame = vp9_bit(&br);
-    info->error_resilient_mode = vp9_bit(&br);
-    if (info->frame_type == 0) {
-        if (!vp9_read_sync_code(&br) || !vp9_read_color_config(&br, info))
-            return 0;
-        vp9_read_frame_size(&br, &info->frame_width, &info->frame_height);
-        vp9_read_render_size(&br, info);
-        info->refresh_frame_flags = 0xff;
-    } else {
-        if (!info->show_frame)
-            info->intra_only = vp9_bit(&br);
-        if (!info->error_resilient_mode)
-            info->reset_frame_context = vp9_bits(&br, 2);
-        if (info->intra_only) {
-            if (!vp9_read_sync_code(&br))
-                return 0;
-            if (info->profile > 0) {
-                if (!vp9_read_color_config(&br, info))
-                    return 0;
-            } else {
-                info->bit_depth = 8;
-                info->subsampling_x = 1;
-                info->subsampling_y = 1;
-            }
-            info->refresh_frame_flags = vp9_bits(&br, 8);
-            vp9_read_frame_size(&br, &info->frame_width, &info->frame_height);
-            vp9_read_render_size(&br, info);
-        } else {
-            info->refresh_frame_flags = vp9_bits(&br, 8);
-            for (int i = 0; i < 3; i++) {
-                info->ref_frame_idx[i] = vp9_bits(&br, 3);
-                info->ref_frame_sign_bias[i + 1] = vp9_bit(&br);
-            }
-            for (int i = 0; i < 3; i++) {
-                if (vp9_bit(&br)) {
-                    info->frame_width = dec->width;
-                    info->frame_height = dec->height;
-                    break;
-                }
-            }
-            if (!info->frame_width)
-                vp9_read_frame_size(&br, &info->frame_width, &info->frame_height);
-            vp9_read_render_size(&br, info);
-            info->allow_high_precision_mv = vp9_bit(&br);
-            info->interpolation_filter = vp9_bit(&br) ? 4 : vp9_bits(&br, 2);
-        }
-    }
-    if (info->frame_type == 0 || info->intra_only || info->error_resilient_mode) {
-        vp9_init_lf_deltas(info);
-        info->segmentation_abs_or_delta_update = 0;
-        memset(info->feature_enabled, 0, sizeof(info->feature_enabled));
-        memset(info->feature_data, 0, sizeof(info->feature_data));
-    }
-    if (!info->error_resilient_mode) {
-        info->refresh_frame_context = vp9_bit(&br);
-        info->frame_parallel_decoding_mode = vp9_bit(&br);
-    } else {
-        info->refresh_frame_context = 0;
-        info->frame_parallel_decoding_mode = 1;
-    }
-    info->frame_context_idx = vp9_bits(&br, 2);
-    vp9_read_loop_filter(&br, info);
-    vp9_read_quant(&br, info);
-    vp9_read_segmentation(&br, info);
-    vp9_read_tiles(&br, info);
-    info->first_partition_size = vp9_bits(&br, 16);
-    info->uncompressed_header_bytes = (br.bit_pos + 7) / 8;
-    if (info->frame_width <= 0)
-        info->frame_width = dec->width;
-    if (info->frame_height <= 0)
-        info->frame_height = dec->height;
-    return info->uncompressed_header_bytes <= size;
-}
-
-static int vp9_dc_quant(int q, int delta) {
-    return vp9_dc_qlookup[clamp_int(q + delta, 0, 255)];
-}
-
-static int vp9_ac_quant(int q, int delta) {
-    return vp9_ac_qlookup[clamp_int(q + delta, 0, 255)];
-}
-
-static int vp9_seg_qindex(const struct VP9FrameInfo *info, int segment) {
-    int q = info->base_q_idx;
-    if (info->segmentation_enabled && info->feature_enabled[segment][0]) {
-        if (info->segmentation_abs_or_delta_update)
-            q = info->feature_data[segment][0];
-        else
-            q += info->feature_data[segment][0];
-    }
-    return clamp_int(q, 0, 255);
-}
-
-static void fill_vp9_segment(const struct VP9FrameInfo *info, int segment,
-                             VASegmentParameterVP9 *seg) {
-    int q = vp9_seg_qindex(info, segment);
-    int lvl = info->loop_filter_level;
-    int scale = 1 << (lvl >> 5);
-    memset(seg, 0, sizeof(*seg));
-    seg->segment_flags.fields.segment_reference_enabled =
-        (uint16_t)info->feature_enabled[segment][2];
-    seg->segment_flags.fields.segment_reference =
-        (uint16_t)info->feature_data[segment][2];
-    seg->segment_flags.fields.segment_reference_skipped =
-        (uint16_t)info->feature_enabled[segment][3];
-    seg->luma_dc_quant_scale = (int16_t)vp9_dc_quant(q, info->delta_q_y_dc);
-    seg->luma_ac_quant_scale = (int16_t)vp9_ac_quant(q, 0);
-    seg->chroma_dc_quant_scale = (int16_t)vp9_dc_quant(q, info->delta_q_uv_dc);
-    seg->chroma_ac_quant_scale = (int16_t)vp9_ac_quant(q, info->delta_q_uv_ac);
-    if (info->segmentation_enabled && info->feature_enabled[segment][1]) {
-        lvl = info->segmentation_abs_or_delta_update ?
-              info->feature_data[segment][1] : lvl + info->feature_data[segment][1];
-    }
-    lvl = clamp_int(lvl, 0, 63);
-    for (int ref = 0; ref < 4; ref++) {
-        for (int mode = 0; mode < 2; mode++) {
-            int fl = lvl;
-            if (info->loop_filter_delta_enabled)
-                fl += (info->loop_filter_ref_deltas[ref] + info->loop_filter_mode_deltas[mode]) * scale;
-            seg->filter_level[ref][mode] = (uint8_t)clamp_int(fl, 0, 63);
-        }
-    }
-}
-
-static LibVADecodeStatus vp9_decoder_decode(LibVADecoder *dec,
-                                            const uint8_t *data, int data_len,
-                                            LibVADecodedFrame *frame) {
-    VABufferID buffers[3];
-    int nbuf = 0;
-    struct VP9FrameInfo info;
-    VADecPictureParameterBufferVP9 pic;
-    VASliceParameterBufferVP9 slice;
-    int surface_index;
-    VASurfaceID surface;
-    VAStatus status;
-    LibVADecodeStatus dstatus;
-    long long t0, t1, t2;
-
-    if (!parse_vp9_frame(dec, data, data_len, &info))
-        return set_message(dec, LIBVA_DEC_UNSUPPORTED, "unsupported VP9 frame header");
-    for (int i = 0; i < (int)(sizeof(buffers) / sizeof(buffers[0])); i++)
-        buffers[i] = VA_INVALID_ID;
-    surface_index = dec->surface_index++ & 3;
-    surface = dec->surfaces[surface_index];
-
-    memset(&pic, 0, sizeof(pic));
-    pic.frame_width = (uint16_t)info.frame_width;
-    pic.frame_height = (uint16_t)info.frame_height;
-    for (int i = 0; i < 8; i++)
-        pic.reference_frames[i] = dec->vp9_refs[i];
-    pic.pic_fields.bits.subsampling_x = (uint32_t)info.subsampling_x;
-    pic.pic_fields.bits.subsampling_y = (uint32_t)info.subsampling_y;
-    pic.pic_fields.bits.frame_type = (uint32_t)info.frame_type;
-    pic.pic_fields.bits.show_frame = (uint32_t)info.show_frame;
-    pic.pic_fields.bits.error_resilient_mode = (uint32_t)info.error_resilient_mode;
-    pic.pic_fields.bits.intra_only = (uint32_t)info.intra_only;
-    pic.pic_fields.bits.allow_high_precision_mv = (uint32_t)info.allow_high_precision_mv;
-    pic.pic_fields.bits.mcomp_filter_type = (uint32_t)info.interpolation_filter;
-    pic.pic_fields.bits.frame_parallel_decoding_mode = (uint32_t)info.frame_parallel_decoding_mode;
-    pic.pic_fields.bits.reset_frame_context = (uint32_t)info.reset_frame_context;
-    pic.pic_fields.bits.refresh_frame_context = (uint32_t)info.refresh_frame_context;
-    pic.pic_fields.bits.frame_context_idx = (uint32_t)info.frame_context_idx;
-    pic.pic_fields.bits.segmentation_enabled = (uint32_t)info.segmentation_enabled;
-    pic.pic_fields.bits.segmentation_temporal_update = (uint32_t)info.segmentation_temporal_update;
-    pic.pic_fields.bits.segmentation_update_map = (uint32_t)info.segmentation_update_map;
-    pic.pic_fields.bits.last_ref_frame = (uint32_t)info.ref_frame_idx[0];
-    pic.pic_fields.bits.last_ref_frame_sign_bias = (uint32_t)info.ref_frame_sign_bias[1];
-    pic.pic_fields.bits.golden_ref_frame = (uint32_t)info.ref_frame_idx[1];
-    pic.pic_fields.bits.golden_ref_frame_sign_bias = (uint32_t)info.ref_frame_sign_bias[2];
-    pic.pic_fields.bits.alt_ref_frame = (uint32_t)info.ref_frame_idx[2];
-    pic.pic_fields.bits.alt_ref_frame_sign_bias = (uint32_t)info.ref_frame_sign_bias[3];
-    pic.pic_fields.bits.lossless_flag = (uint32_t)info.lossless;
-    pic.filter_level = (uint8_t)info.loop_filter_level;
-    pic.sharpness_level = (uint8_t)info.loop_filter_sharpness;
-    pic.log2_tile_rows = (uint8_t)info.tile_rows_log2;
-    pic.log2_tile_columns = (uint8_t)info.tile_cols_log2;
-    pic.frame_header_length_in_bytes = (uint8_t)info.uncompressed_header_bytes;
-    pic.first_partition_size = (uint16_t)info.first_partition_size;
-    memcpy(pic.mb_segment_tree_probs, info.segmentation_tree_probs, sizeof(pic.mb_segment_tree_probs));
-    if (info.segmentation_temporal_update)
-        memcpy(pic.segment_pred_probs, info.segmentation_pred_probs, sizeof(pic.segment_pred_probs));
-    else
-        memset(pic.segment_pred_probs, 255, sizeof(pic.segment_pred_probs));
-    pic.profile = (uint8_t)info.profile;
-    pic.bit_depth = (uint8_t)info.bit_depth;
-
-    memset(&slice, 0, sizeof(slice));
-    slice.slice_data_size = (uint32_t)data_len;
-    slice.slice_data_offset = 0;
-    slice.slice_data_flag = VA_SLICE_DATA_FLAG_ALL;
-    for (int i = 0; i < 8; i++)
-        fill_vp9_segment(&info, i, &slice.seg_param[i]);
-
-    status = vaCreateBuffer(dec->display, dec->context, VAPictureParameterBufferType,
-                            sizeof(pic), 1, &pic, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VASliceParameterBufferType,
-                                sizeof(slice), 1, &slice, &buffers[nbuf++]);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaCreateBuffer(dec->display, dec->context, VASliceDataBufferType,
-                                (unsigned int)data_len, 1, (void *)data, &buffers[nbuf++]);
-    if (status != VA_STATUS_SUCCESS) {
-        destroy_buffers(dec, buffers, nbuf);
-        return set_error(dec, status, "vaCreateBuffer(VP9)");
-    }
-    libva_log("VP9 dbg: STORED bitdepth=%d ss=%d,%d", dec->vp9_bit_depth, dec->vp9_subsampling_x, dec->vp9_subsampling_y);
-    libva_log("VP9 dbg: profile=%d type=%d show=%d errres=%d intra_only=%d bitdepth=%d ss=%d,%d "
-              "size=%dx%d refidx=%d,%d,%d refresh=0x%02x reffrm=%u,%u,%u,%u,%u,%u,%u,%u "
-              "lf_level=%d lf_sharp=%d base_q=%d lossless=%d seg_en=%d tile=%d,%d fhlen=%d fps=%d datalen=%d",
-              info.profile, info.frame_type, info.show_frame, info.error_resilient_mode, info.intra_only,
-              info.bit_depth, info.subsampling_x, info.subsampling_y,
-              info.frame_width, info.frame_height,
-              info.ref_frame_idx[0], info.ref_frame_idx[1], info.ref_frame_idx[2],
-              info.refresh_frame_flags,
-              (unsigned)dec->vp9_refs[0], (unsigned)dec->vp9_refs[1], (unsigned)dec->vp9_refs[2],
-              (unsigned)dec->vp9_refs[3], (unsigned)dec->vp9_refs[4], (unsigned)dec->vp9_refs[5],
-              (unsigned)dec->vp9_refs[6], (unsigned)dec->vp9_refs[7],
-              info.loop_filter_level, info.loop_filter_sharpness, info.base_q_idx, info.lossless,
-              info.segmentation_enabled, info.tile_cols_log2, info.tile_rows_log2,
-              info.uncompressed_header_bytes, info.first_partition_size, data_len);
-    t0 = usec_now();
-    status = vaBeginPicture(dec->display, dec->context, surface);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaRenderPicture(dec->display, dec->context, buffers, nbuf);
-    if (status == VA_STATUS_SUCCESS)
-        status = vaEndPicture(dec->display, dec->context);
-    t1 = usec_now();
-    destroy_buffers(dec, buffers, nbuf);
-    if (status != VA_STATUS_SUCCESS)
-        return set_error(dec, status, "VA VP9 decode submit");
-    status = vaSyncSurface(dec->display, surface);
-    t2 = usec_now();
-    if (status != VA_STATUS_SUCCESS)
-        return set_error(dec, status, "vaSyncSurface");
-    /* update the decoder state (incl. the colour range) before mapping the output,
-     * so that map_output reports this frame's range and not the previous one's: */
-    save_vp9_state(dec, &info);
-    dstatus = map_output(dec, surface, frame);
-    if (dstatus != LIBVA_DEC_OK)
-        return dstatus;
-    for (int i = 0; i < 8; i++) {
-        if (info.refresh_frame_flags & (1 << i))
-            dec->vp9_refs[i] = surface;
-    }
-    frame->us_submit = (int)(t1 - t0);
-    frame->us_sync = (int)(t2 - t1);
-    dec->frames++;
-    return LIBVA_DEC_OK;
+/* pin a slot for the painter; returns 0 on success */
+static int h264_pin_surface(LibVADecoder *dec, int surface_index) {
+    if (surface_index < 0 || surface_index >= dec->num_surfaces)
+        return -1;
+    atomic_fetch_or(&dec->pinned_bits, 1u << surface_index);
+    return 0;
 }
 
 static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
@@ -2159,7 +1430,6 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
     int surface_index;
     VASurfaceID surface;
     VAStatus status;
-    LibVADecodeStatus dstatus;
     VAPictureParameterBufferH264 pic;
     VAIQMatrixBufferH264 iq;
     VASliceParameterBufferH264 slice;
@@ -2181,24 +1451,88 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
 
     for (int i = 0; i < (int)(sizeof(buffers) / sizeof(buffers[0])); i++)
         buffers[i] = VA_INVALID_ID;
+    {
+        /* the pool is sized from the stream itself: SPS
+         * max_num_ref_frames + the current picture + export slack.
+         * Surfaces are full NV12 frames of VRAM, so provisioning the
+         * spec worst case (16 refs) for every stream is expensive -
+         * nvenc emits 3. */
+        int refs = params.valid_sps ? params.max_num_ref_frames : 0;
+        if (refs < 1)
+            refs = 1;
+        if (refs > H264_DPB_SIZE)
+            refs = H264_DPB_SIZE;
+        int needed = refs + 1 + H264_EXPORT_SLACK;
+        if (dec->context == VA_INVALID_ID) {
+            if (!params.valid_sps)
+                return set_message(dec, LIBVA_DEC_ERROR,
+                                   "no SPS before the first slice");
+            dec->num_surfaces = needed;
+            LibVADecodeStatus astatus = alloc_surfaces_and_context(dec);
+            if (astatus != LIBVA_DEC_OK)
+                return astatus;
+            libva_log("libva h264: allocated %d surfaces (%d reference frames + 1 + %d export slack)",
+                      dec->num_surfaces, refs, H264_EXPORT_SLACK);
+        } else if (needed > dec->num_surfaces) {
+            /* a mid-stream SPS raised max_num_ref_frames beyond the
+             * pool: fail loudly - the CodecStateException restart
+             * re-sizes from the new SPS */
+            snprintf(dec->last_error, sizeof(dec->last_error),
+                     "stream now declares %d reference frames, pool has %d surfaces",
+                     refs, dec->num_surfaces);
+            dec->last_status = (int)LIBVA_DEC_ERROR;
+            libva_log("libva decode error: %s", dec->last_error);
+            return LIBVA_DEC_ERROR;
+        }
+    }
     is_idr = first->nal_type == 5;
-    surface_index = dec->surface_index++ & 3;
+    if (params.pic_order_cnt_type == 1)
+        return set_message(dec, LIBVA_DEC_UNSUPPORTED,
+                           "H.264 pic_order_cnt_type 1 is not supported");
+    if (is_idr) {
+        /* spec 8.2.5.1: IDR unmarks all reference pictures */
+        h264_dpb_flush(dec);
+        dec->poc_prev_lsb = 0;
+        dec->poc_prev_msb = 0;
+        dec->poc_prev_frame_num = 0;
+        dec->poc_prev_frame_num_offset = 0;
+    }
+    int top_foc = 0, bottom_foc = 0;
+    if (h264_compute_poc(dec, &params, first, is_idr, &top_foc, &bottom_foc) != 0)
+        return set_message(dec, LIBVA_DEC_UNSUPPORTED,
+                           "H.264 pic_order_cnt_type 1 is not supported");
+    surface_index = h264_pick_surface(dec);
+    if (surface_index < 0)
+        return set_message(dec, LIBVA_DEC_ERROR, "no free H.264 surface");
     surface = dec->surfaces[surface_index];
 
     memset(&pic, 0, sizeof(pic));
     pic.CurrPic.picture_id = surface;
     pic.CurrPic.frame_idx = (uint32_t)first->frame_num;
-    pic.CurrPic.flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-    pic.CurrPic.TopFieldOrderCnt = first->poc_lsb;
-    pic.CurrPic.BottomFieldOrderCnt = first->poc_lsb;
+    pic.CurrPic.flags = first->nal_ref_idc ? VA_PICTURE_H264_SHORT_TERM_REFERENCE : 0;
+    pic.CurrPic.TopFieldOrderCnt = top_foc;
+    pic.CurrPic.BottomFieldOrderCnt = bottom_foc;
     for (int i = 0; i < 16; i++)
         fill_invalid_picture(&pic.ReferenceFrames[i]);
-    if (!is_idr && dec->have_reference) {
-        pic.ReferenceFrames[0].picture_id = dec->surfaces[dec->ref_surface_index];
-        pic.ReferenceFrames[0].frame_idx = (uint32_t)dec->ref_frame_num;
-        pic.ReferenceFrames[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-        pic.ReferenceFrames[0].TopFieldOrderCnt = dec->ref_poc_lsb;
-        pic.ReferenceFrames[0].BottomFieldOrderCnt = dec->ref_poc_lsb;
+    {
+        int n = 0;
+        for (uint32_t refs = dec->dpb_used; refs && n < 16; refs &= refs - 1)
+            h264_fill_va_picture(&pic.ReferenceFrames[n++], dec, __builtin_ctz(refs));
+    }
+    if (params.valid_sps &&
+        ((params.width_mbs_minus1 + 1) * 16 > dec->surface_width ||
+         (params.height_mbs_minus1 + 1) * 16 > dec->surface_height)) {
+        /* an encoder padding beyond our 32-aligned pool would overflow
+         * surface rows again - fail the decode loudly (the caller
+         * raises CodecStateException; persistent failure falls back to
+         * software decode via the setup-cost ratchet) */
+        dec->last_status = (int)LIBVA_DEC_ERROR;
+        snprintf(dec->last_error, sizeof(dec->last_error),
+                 "coded size %dx%d exceeds surface pool %dx%d",
+                 (params.width_mbs_minus1 + 1) * 16, (params.height_mbs_minus1 + 1) * 16,
+                 dec->surface_width, dec->surface_height);
+        libva_log("libva decode error: %s", dec->last_error);
+        return LIBVA_DEC_ERROR;
     }
     pic.picture_width_in_mbs_minus1 = (uint16_t)(params.valid_sps ?
                                                 params.width_mbs_minus1 :
@@ -2232,7 +1566,7 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
         (uint32_t)params.deblocking_filter_control_present_flag;
     pic.pic_fields.bits.redundant_pic_cnt_present_flag = (uint32_t)params.redundant_pic_cnt_present_flag;
     pic.pic_fields.bits.constrained_intra_pred_flag = (uint32_t)params.constrained_intra_pred_flag;
-    pic.pic_fields.bits.reference_pic_flag = 1;
+    pic.pic_fields.bits.reference_pic_flag = (uint32_t)(first->nal_ref_idc != 0);
     pic.frame_num = (uint16_t)first->frame_num;
     status = vaCreateBuffer(dec->display, dec->context, VAPictureParameterBufferType,
                             sizeof(pic), 1, &pic, &buffers[nbuf++]);
@@ -2258,7 +1592,7 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
         slice.slice_data_bit_offset = (uint16_t)si->bit_offset;
         slice.first_mb_in_slice = (uint16_t)si->first_mb;
         slice.slice_type = (uint8_t)(si->slice_type % 5);
-        slice.direct_spatial_mv_pred_flag = (uint8_t)si->direct_spatial_mv_pred_flag;
+        slice.direct_spatial_mv_pred_flag = 0;    /* B slices rejected at parse */
         slice.num_ref_idx_l0_active_minus1 = (uint8_t)si->num_ref_idx_l0_active_minus1;
         slice.num_ref_idx_l1_active_minus1 = (uint8_t)si->num_ref_idx_l1_active_minus1;
         slice.cabac_init_idc = (uint8_t)si->cabac_init_idc;
@@ -2278,12 +1612,11 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
             fill_invalid_picture(&slice.RefPicList0[i]);
             fill_invalid_picture(&slice.RefPicList1[i]);
         }
-        if (!is_idr && dec->have_reference) {
-            slice.RefPicList0[0].picture_id = dec->surfaces[dec->ref_surface_index];
-            slice.RefPicList0[0].frame_idx = (uint32_t)dec->ref_frame_num;
-            slice.RefPicList0[0].flags = VA_PICTURE_H264_SHORT_TERM_REFERENCE;
-            slice.RefPicList0[0].TopFieldOrderCnt = dec->ref_poc_lsb;
-            slice.RefPicList0[0].BottomFieldOrderCnt = dec->ref_poc_lsb;
+        if ((si->slice_type % 5) == 0 || (si->slice_type % 5) == 3) {
+            struct H264DPBEntry *l0[32];
+            int nl0 = h264_build_ref_list_l0(dec, &params, si, l0, 32);
+            for (int i = 0; i < nl0; i++)
+                h264_fill_va_picture(&slice.RefPicList0[i], dec, (int)(l0[i] - dec->dpb));
         }
         status = vaCreateBuffer(dec->display, dec->context, VASliceParameterBufferType,
                                 sizeof(slice), 1, &slice, &buffers[nbuf++]);
@@ -2315,17 +1648,66 @@ static LibVADecodeStatus h264_decoder_decode(LibVADecoder *dec,
     if (status != VA_STATUS_SUCCESS)
         return set_error(dec, status, "vaSyncSurface");
 
-    dstatus = map_output(dec, surface, frame);
-    if (dstatus != LIBVA_DEC_OK)
-        return dstatus;
     frame->us_submit = (int)(t1 - t0);
     frame->us_sync = (int)(t2 - t1);
-    dec->have_reference = 1;
-    dec->ref_surface_index = surface_index;
-    dec->ref_frame_num = first->frame_num;
-    dec->ref_poc_lsb = first->poc_lsb;
-    dec->frames++;
+    if (first->nal_ref_idc) {
+        int cur_is_lt = 0, cur_lt_idx = 0, had_mmco5 = 0;
+        int ins_frame_num = first->frame_num;
+        if (is_idr) {
+            /* DPB already flushed before decode */
+            cur_is_lt = first->idr_long_term_reference_flag;
+        } else if (first->adaptive_ref_pic_marking) {
+            h264_dpb_apply_mmco(dec, &params, first, first->frame_num,
+                                &cur_is_lt, &cur_lt_idx, &had_mmco5);
+        } else {
+            h264_dpb_sliding_window(dec, &params, first->frame_num);
+        }
+        if (had_mmco5) {
+            /* spec 8.2.1: after MMCO5 the current picture counts as
+             * frame_num 0 with its POC rebased to zero */
+            int temp = top_foc < bottom_foc ? top_foc : bottom_foc;
+            top_foc -= temp;
+            bottom_foc -= temp;
+            ins_frame_num = 0;
+            dec->poc_prev_lsb = top_foc;
+            dec->poc_prev_msb = 0;
+            dec->poc_prev_frame_num = 0;
+            dec->poc_prev_frame_num_offset = 0;
+        }
+        h264_dpb_insert(dec, surface_index, ins_frame_num,
+                        top_foc, bottom_foc, cur_is_lt, cur_lt_idx);
+    }
+
+    /* zero-copy export: the frame never left the GPU - hand the
+     * caller the GL_NV_vdpau_interop handle triple and pin the slot
+     * (pinned only AFTER a successful export, so a refusal cannot
+     * leak a pin) */
+    vdpau_va_export_v1_fn fn = (vdpau_va_export_v1_fn)dec->export_fn;
+    int rc = fn(dec->display, dec->surfaces[surface_index],
+                &frame->vdp_device, &frame->get_proc_address, &frame->vdp_surface);
+    if (rc != 0)
+        return set_message(dec, LIBVA_DEC_ERROR, "surface export refused");
+    h264_pin_surface(dec, surface_index);
+    frame->surface_index = surface_index;
+    frame->width = dec->width;
+    frame->height = dec->height;
+    frame->full_range = dec->full_range;
     return LIBVA_DEC_OK;
+}
+
+/* unpin a slot so the decode-target picker may reuse it; lifetime is
+ * the caller's concern (the decoder must stay alive while any
+ * exported frame or GL registration references it) */
+void libva_decoder_release_surface(LibVADecoder *dec, int surface_index) {
+    if (!dec || surface_index < 0 || surface_index >= dec->num_surfaces)
+        return;
+    atomic_fetch_and(&dec->pinned_bits, ~(1u << surface_index));
+}
+
+int libva_decoder_pinned_count(LibVADecoder *dec) {
+    if (!dec)
+        return 0;
+    return __builtin_popcount(atomic_load(&dec->pinned_bits));
 }
 
 LibVADecodeStatus libva_decoder_decode(LibVADecoder *dec,
@@ -2333,21 +1715,10 @@ LibVADecodeStatus libva_decoder_decode(LibVADecoder *dec,
                                        LibVADecodedFrame *frame) {
     if (!dec || !data || data_len <= 0 || !frame)
         return LIBVA_DEC_ERROR;
+    memset(frame, 0, sizeof(*frame));
     if (dec->codec == LIBVA_CODEC_H264)
         return h264_decoder_decode(dec, data, data_len, frame);
-    if (dec->codec == LIBVA_CODEC_VP8)
-        return vp8_decoder_decode(dec, data, data_len, frame);
-    if (dec->codec == LIBVA_CODEC_VP9)
-        return vp9_decoder_decode(dec, data, data_len, frame);
     return set_message(dec, LIBVA_DEC_UNSUPPORTED, "unknown VA decode codec");
-}
-
-int libva_decoder_get_width(LibVADecoder *dec) {
-    return dec ? dec->width : 0;
-}
-
-int libva_decoder_get_height(LibVADecoder *dec) {
-    return dec ? dec->height : 0;
 }
 
 int libva_decoder_get_last_status(LibVADecoder *dec) {

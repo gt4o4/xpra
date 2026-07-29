@@ -9,7 +9,6 @@ include xpra/codecs/libva/va_decode.c
 include xpra/codecs/libva/va_decode.h
 include xpra/codecs/libva/va_encode.c
 include xpra/codecs/libva/va_encode.h
-include xpra/codecs/libva/va_vpx_tables.h
 include xpra/codecs/mf/mf_decode.c
 include xpra/codecs/mf/mf_decode.h
 include xpra/codecs/mf/mf_encode.c

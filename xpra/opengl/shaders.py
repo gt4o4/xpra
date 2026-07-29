@@ -152,6 +152,77 @@ void main()
 """
 
 
+def gen_NV12_FIELDS_to_RGB(cs="bt601", full_range=True) -> str:
+    """NV12 delivered as two interlaced FIELDS of separate luma+chroma
+    textures - the shape GL_NV_vdpau_interop (v1) gives a registered
+    VdpVideoSurface: tex 0/1 = top/bottom-field luma, tex 2/3 =
+    top/bottom-field chroma.  Progressive frames interleave back by
+    row parity (interop2, which can expose whole frames, does not
+    exist on legacy drivers).
+
+    At 1:1 (the normal case) sample positions are exactly integral,
+    so each fragment is one luma fetch and one co-sited chroma
+    fetch; non-integral draws nearest-sample through the same
+    fetches."""
+    if cs not in CS_MULTIPLIERS:
+        raise ValueError(f"unsupported colorspace {cs}")
+    a, b, c, d, e = CS_MULTIPLIERS[cs]
+    f = - c * d / b
+    g = - a * e / b
+    ymult = "" if full_range else " * 1.1643835616438356"
+    umult = vmult = "" if full_range else " * 1.1383928571428572"
+    yoffset = "" if full_range else " - 0.062745098"
+    return f"""
+#version {GLSL_VERSION}
+layout(origin_upper_left) in vec4 gl_FragCoord;
+uniform vec2 viewport_pos;
+uniform vec2 scaling;
+uniform vec2 vid_size;
+uniform sampler2DRect Y0;
+uniform sampler2DRect C0;
+uniform sampler2DRect Y1;
+uniform sampler2DRect C1;
+layout(location = 0) out vec4 frag_color;
+
+// fetch luma video row r, texel column x: clamp the VIDEO row first
+// (a tap clamped after the field split would land in the wrong field),
+// then split by parity into the half-height field texture
+float fY(float x, float r)
+{{
+    r = clamp(r, 0.0, vid_size.y - 1.0);
+    vec2 p = vec2(x + 0.5, floor(r * 0.5) + 0.5);
+    return (mod(r, 2.0) < 0.5) ? texture(Y0, p).r : texture(Y1, p).r;
+}}
+
+// fetch chroma-plane row cr, texel column cx (chroma plane is also
+// field-split; columns clamp via the sampler's CLAMP_TO_EDGE)
+vec2 fC(float cx, float cr)
+{{
+    cr = clamp(cr, 0.0, floor((vid_size.y - 1.0) * 0.5));
+    vec2 p = vec2(cx + 0.5, floor(cr * 0.5) + 0.5);
+    return (mod(cr, 2.0) < 0.5) ? texture(C0, p).rg : texture(C1, p).rg;
+}}
+
+void main()
+{{
+    vec2 pos = (gl_FragCoord.xy - viewport_pos.xy) / scaling;
+    vec2 s = pos - 0.5;              // texel-center space (integral at 1:1)
+    vec2 base = floor(s);
+    highp float y = fY(base.x, base.y);
+    vec2 uv = fC(floor(base.x * 0.5), floor(base.y * 0.5));
+    y = (y{yoffset}){ymult};
+    highp float u = (uv.r - 0.5){umult};
+    highp float v = (uv.g - 0.5){vmult};
+
+    highp float r = y +           {e} * v;
+    highp float g = y + {f} * u + {g} * v;
+    highp float b = y + {d} * u;
+
+    frag_color = vec4(r, g, b, 1.0);
+}}
+"""
+
+
 def gen_AYUV_to_RGB(cs="bt601", full_range=True, fmt="AYUV") -> str:
     """Packed AYUV / XYUV -> RGB conversion.
     Memory order is V,U,Y,A-or-X, which maps to R,G,B,A in GL_RGBA8."""
@@ -393,6 +464,7 @@ SOURCE: dict[str, str] = {
 for full in (False, True):
     suffix = "_FULL" if full else ""
     SOURCE[f"NV12_to_RGB{suffix}"] = gen_NV12_to_RGB(full_range=full)
+    SOURCE[f"NV12_FIELDS_to_RGB{suffix}"] = gen_NV12_FIELDS_to_RGB(full_range=full)
     SOURCE[f"AYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="AYUV")
     SOURCE[f"XYUV_to_RGB{suffix}"] = gen_AYUV_to_RGB(full_range=full, fmt="XYUV")
     SOURCE[f"Y410_to_RGB{suffix}"] = gen_Y410_to_RGB(full_range=full)
