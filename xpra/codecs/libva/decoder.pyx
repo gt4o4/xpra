@@ -188,9 +188,8 @@ cdef bint supports(str encoding, str colorspace):
 
 
 # driver limits, overridable for hardware whose VA driver cannot
-# express them.  Defaults = the VDPAU feature-set-A envelope this
-# decoder exists for (H264 maxes at 2048x2048 AND 8192 macroblocks =
-# 2097152 pixels); the envs remain as overrides for other silicon:
+# express them (ie: the VDPAU bridge on feature-set-A NVIDIA: H264
+# maxes at 2048x2048 AND 8192 macroblocks = 2097152 pixels):
 # 0 = unlimited: concurrent in-process streams are safe now that
 # surfaces are 32-aligned - the historical cross-stream luma
 # corruption was VP2 writing 32-aligned rows past under-aligned
@@ -202,6 +201,9 @@ cdef bint supports(str encoding, str colorspace):
 # instance is live (squared utilization penalty) - use 1 to gate, 0 to
 # allow multi-stream; intermediate values behave like 1 in practice.
 MAX_INSTANCES = envint("XPRA_LIBVA_MAX_INSTANCES", 0)
+# defaults = the VP2/GT130 envelope (2048x2048 dims, 8192 macroblocks
+# of area) - the deployment this decoder exists for; the envs remain
+# as overrides for different silicon
 MAX_WIDTH = envint("XPRA_LIBVA_MAX_WIDTH", 2048)
 MAX_HEIGHT = envint("XPRA_LIBVA_MAX_HEIGHT", 2048)
 MAX_PIXELS = envint("XPRA_LIBVA_MAX_PIXELS", 2 * 1024 * 1024)
@@ -262,6 +264,28 @@ cdef class Decoder:
         log("libva.decoder.init_context%s", (encoding, width, height, colorspace, options))
         assert encoding in ENCODINGS, "unsupported encoding: %s" % encoding
         assert colorspace in COLORSPACES[encoding], "invalid colorspace %s for %s" % (colorspace, encoding)
+        if encoding == "h264":
+            # scaled paints are CUDA-only (the GL scaled route is gone):
+            # a session whose CUDA context cannot bind the shared
+            # VdpDevice must not offer VDPAU h264 at all - the same
+            # doctrine as the export-only requirement below (the scorer
+            # delists this decoder, openh264 takes over).  This is also
+            # what guarantees the bind runs BEFORE any context-creating
+            # CUDA call: decoder creation precedes every paint.  The
+            # bind module is compiled only where libva + gpujpeg are
+            # built - its absence means a CUDA-less build, same verdict.
+            try:
+                from xpra.codecs.cuda_vdpau import ensure_vdpau_bind, scale_available
+            except ImportError as e:
+                raise EncodingNotSupported(f"h264: no CUDA-VDPAU module ({e})") from None
+            if not ensure_vdpau_bind():
+                raise EncodingNotSupported("h264: no CUDA-VDPAU bind (scaled paints are CUDA-only)")
+            # the second half of the CUDA-only doctrine: scaled paints
+            # need the kernel loader (pycuda + the sm_11 cubin).  On
+            # hosts that carry pycuda for other codecs but no cubin
+            # (the nvenc server) the cubin check is what closes this.
+            if not scale_available():
+                raise EncodingNotSupported("h264: no CUDA scale loader (cubin/pycuda)")
         # odd display sizes are fine: the bitstream is coded at the
         # padded even size (SPS crop carries the display size) and the
         # NV12 copy-out handles odd width/height (ceil'd chroma rows,
