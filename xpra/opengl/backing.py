@@ -46,7 +46,8 @@ from OpenGL.GL import (
     glEnableVertexAttribArray, glVertexAttribPointer, glDisableVertexAttribArray,
     glGenVertexArrays, glBindVertexArray, glDeleteVertexArrays,
     glUseProgram, GL_TEXTURE_RECTANGLE, glGetUniformLocation, glUniform1i, glUniform1f, glUniform2f, glUniform4f,
-    GL_TEXTURE_BUFFER, glTexBuffer,
+    GL_TEXTURE_BUFFER, glTexBuffer, GL_R32UI, GL_MAX_TEXTURE_BUFFER_SIZE,
+    GL_READ_ONLY,
 )
 from OpenGL.GL.ARB.framebuffer_object import (
     GL_FRAMEBUFFER, GL_DRAW_FRAMEBUFFER, GL_READ_FRAMEBUFFER,
@@ -107,6 +108,12 @@ NVJPEG = envbool("XPRA_OPENGL_NVJPEG", True)
 NVDEC = envbool("XPRA_OPENGL_NVDEC", False)
 ALWAYS_RGBA = envbool("XPRA_OPENGL_ALWAYS_RGBA", False)
 SHOW_PLANE_RANGES = envbool("XPRA_SHOW_PLANE_RANGES", False)
+# output rows per band of the scaled VDPAU paint (see
+# render_vdpau_fields_scaled): per band the CUDA kernel fills the
+# H-strip buffer and the lanczos-v shader draws it - small enough to
+# keep the strip ~1MB, large enough to amortize launches.  Must be
+# >= 1 (the band loop advances by min(SCALE_BAND_ROWS, height)).
+SCALE_BAND_ROWS = 128
 OPENGL_SCALING_FILTER = os.environ.get("XPRA_OPENGL_SCALING_FILTER", "").lower()
 
 CURSOR_IDLE_TIMEOUT: int = envint("XPRA_CURSOR_IDLE_TIMEOUT", 6)
@@ -289,6 +296,19 @@ class GLWindowBackingBase(WindowBackingBase):
         self.vdpau_device: int = 0
         self.vdpau_decoder = None           # decoder whose device is pinned by this backing
         self.vdpau_registrations: dict[int, tuple[int, tuple[int, ...]]] = {}
+        # CUDA scaled paint: the libgpujpeg P1+H kernel writes each
+        # band's H-strip into a CUDA-registered GL buffer, and the
+        # lanczos-v shader (a texture-buffer fetch pass) applies the
+        # vertical taps straight into the offscreen FBO.  The buffer
+        # is GROW-ONLY per backing (video-geometry churn must not
+        # churn register/unregister on this driver) with a DEDICATED
+        # texture-buffer object (never the jpeg path's tbo_texture).
+        # cuda_surface_resources: per-surface CUDA registrations,
+        # cached like the GL ones and flushed together with them
+        self.cuda_surface_resources: dict[int, int] = {}
+        self.cuda_strip_buf: tuple[int, int] | None = None     # (gl buffer, cuda resource)
+        self.cuda_strip_words = 0                              # allocated capacity (uint32 texels)
+        self.cuda_strip_tex = 0                                # texture-buffer object name
         self.texture_size: tuple[int, int] = (0, 0)
         # current storage size of whatever texture sits in the TEX_TMP_FBO
         # slot (swap_fbos alternates the GL name, the slot is stable;
@@ -499,7 +519,7 @@ class GLWindowBackingBase(WindowBackingBase):
         vertex_shader = self.init_shader("vertex", GL_VERTEX_SHADER)
         from xpra.opengl.shaders import SOURCE
         for name, source in SOURCE.items():
-            if name in ("overlay", "blend", "vertex", "fixed-color", "upscale", "bgrx-buffer"):
+            if name in ("overlay", "blend", "vertex", "fixed-color", "upscale", "bgrx-buffer", "lanczos-v"):
                 continue
             fragment_shader = self.init_shader(name, GL_FRAGMENT_SHADER)
             self.init_program(name, vertex_shader, fragment_shader)
@@ -522,6 +542,14 @@ class GLWindowBackingBase(WindowBackingBase):
             self.init_program("bgrx-buffer", vertex_shader, tbo_shader)
         except RuntimeError:
             log.warn("Warning: bgrx-buffer shader failed to compile, gpujpeg will decode to host memory")
+        # the vertical half of the scaled VDPAU paint (buffer textures
+        # again); without it scaled paints raise and the server repaints
+        # - same doctrine as a missing CUDA bind
+        try:
+            lv_shader = self.init_shader("lanczos-v", GL_FRAGMENT_SHADER)
+            self.init_program("lanczos-v", vertex_shader, lv_shader)
+        except RuntimeError:
+            log.warn("Warning: lanczos-v shader failed to compile, scaled video paints will fail")
 
     def set_vao(self, index=0):
         vertices = [-1, -1, 1, -1, -1, 1, 1, 1]
@@ -702,7 +730,12 @@ class GLWindowBackingBase(WindowBackingBase):
             glFinish()
         except GLError:
             log("glFinish failed in close_gl", exc_info=True)
-        self.vdpau_release_device()
+        try:
+            self.vdpau_release_device()
+        except Exception:
+            # NullFunctionError etc. are not GLError - an escape here
+            # must not skip the remaining teardown
+            log("vdpau_release_device failed in close_gl", exc_info=True)
         self.free_cuda_context()
         try:
             from OpenGL.GL import glDeleteProgram, glDeleteShader
@@ -1438,9 +1471,10 @@ class GLWindowBackingBase(WindowBackingBase):
             # zero-copy path: the decoder writes its BGRX output
             # DIRECTLY into a CUDA-mapped pixel-unpack PBO under the
             # GL context - no intermediate buffer, no host bytes, no
-            # copies.  jpega decodes its grayscale alpha plane into a
-            # second PBO and the paint shader merges the two in the
-            # fetch, so the whole jpega decode is GPU-side too.  The
+            # copies.  jpega decodes its grayscale alpha plane into
+            # the SAME buffer (appended after the BGRX pixels) and the
+            # paint shader reads both through one RGBA8 view, so the
+            # whole jpega decode is GPU-side too.  The
             # decode runs on the UI thread like paint_nvjpeg's -
             # acceptable at refresh rates, and any failure falls back
             # to the host path.
@@ -1479,9 +1513,22 @@ class GLWindowBackingBase(WindowBackingBase):
         # (decode_into_gl_buffer: register/map/decode/unmap in one
         # call), then draw_pbo_bgrx rasters the linear bytes straight
         # into the offscreen FBO through a buffer texture.  jpega
-        # decodes its grayscale alpha plane into a SECOND pbo and the
-        # paint shader merges the two in the fetch - the whole jpega
-        # decode is GPU-side.
+        # appends its grayscale alpha plane to the SAME buffer and the
+        # paint shader reads both through one RGBA8 view - the whole
+        # jpega decode is GPU-side.
+        try:
+            self.do_paint_gpujpeg(gl_context, encoding, img_data, x, y,
+                                  width, height, options, callbacks)
+        except Exception as e:
+            log("paint_gpujpeg failed", exc_info=True)
+            # ack the failure so the server repaints - an exception
+            # swallowed by the idle handler would leave the region
+            # permanently stale
+            fire_paint_callbacks(callbacks, False, str(e))
+
+    def do_paint_gpujpeg(self, gl_context, encoding: str, img_data, x: int, y: int,
+                         width: int, height: int,
+                         options: typedict, callbacks: PaintCallbacks) -> None:
         self.gl_init(gl_context)
         if "bgrx-buffer" not in self.programs:
             # no buffer-texture support (GL < 3.1): host decode
@@ -1541,9 +1588,11 @@ class GLWindowBackingBase(WindowBackingBase):
         if not self.tbo_texture:
             self.tbo_texture = glGenTextures(1)
         self.draw_to_offscreen()
+        program = self.programs.get("bgrx-buffer")
+        if not program:
+            raise RuntimeError("no bgrx-buffer shader program")
         bh = self.size[1]
         with TemporaryViewport(x, bh - y - h, w, h):
-            program = self.programs["bgrx-buffer"]
             glUseProgram(program)
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_BUFFER, self.tbo_texture)
@@ -1967,13 +2016,14 @@ class GLWindowBackingBase(WindowBackingBase):
         # glActiveTexture(GL_TEXTURE0)    #redundant, we always call render_planar_update afterwards
 
     def vdpau_interop_init(self, decoder, device: int, get_proc_address: int) -> bool:
-        # lazy per-backing GL_NV_vdpau_interop init; re-init on device
-        # change (a decoder restart re-opens the VA display = new
-        # VdpDevice: each decoder generation lives and dies on its OWN
-        # device, so creates land on empty devices and teardown bursts
-        # on dying ones - a persistent shared device was tried and
-        # RETIRED 2026-07-20: same-device generational churn injures the
-        # VP2 engine persistently, see the host notes).  Holding
+        # lazy per-backing GL_NV_vdpau_interop init.  The bridge shares
+        # ONE process-global, never-destroyed VdpDevice across all
+        # VADisplays (the 2026-07-20 retirement of that design was a
+        # misdiagnosis of the 16-vs-32 alignment bug; revived 2026-07-26
+        # - and the CUDA scaled paint DEPENDS on it: the once-per-process
+        # cudaVDPAUSetVDPAUDevice bind can never follow a device change),
+        # so device changes only happen across full session resets.
+        # Holding
         # `self.vdpau_decoder` is what keeps the device alive: the
         # decoder's C context (and with it the VdpDevice that GL
         # registered surfaces against) is destroyed by Python object
@@ -1984,6 +2034,18 @@ class GLWindowBackingBase(WindowBackingBase):
             # nothing would keep the VdpDevice alive - refuse
             raise RuntimeError("no decoder reference for vdpau device %#x" % device)
         if self.vdpau_device == device:
+            if self.vdpau_decoder is decoder:
+                return True
+            # same device, NEW decoder generation - the bridge shares
+            # one process-global VdpDevice, so the InitNV session stays
+            # valid, but the old pool's surface handles may be reused
+            # by the new pool: drop the registration caches (GL + CUDA)
+            # and re-pin the new decoder
+            glFinish()
+            self.vdpau_teardown_registrations()
+            glFinish()
+            self.vdpau_decoder = decoder
+            log("vdpau interop: rebound device %#x to new decoder %s", device, decoder)
             return True
         self.vdpau_release_device()
         glVDPAUInitNV(ctypes.c_void_p(device), ctypes.c_void_p(get_proc_address))
@@ -2002,19 +2064,34 @@ class GLWindowBackingBase(WindowBackingBase):
         self.vdpau_decoder = None
         if self.vdpau_device:
             try:
+                # idle FIRST: the strip buffer must not be
+                # CUDA-unregistered while queued GL reads of it are
+                # still in flight (paint-error path)
                 glFinish()
+                self.free_cuda_scale_buffers()
                 self.vdpau_teardown_registrations()
                 glVDPAUFiniNV()
                 glFinish()
             except GLError:
                 log("vdpau interop teardown failed", exc_info=True)
             self.vdpau_device = 0
+        else:
+            self.free_cuda_scale_buffers()
         del decoder
 
     def vdpau_teardown_registrations(self) -> None:
         # must run with the GL context current; quiesced lifecycle:
         # unregister everything in one batch (churn is the fault trigger
         # on legacy NVIDIA - see the host notes)
+        cuda_regs = self.cuda_surface_resources
+        self.cuda_surface_resources = {}
+        if cuda_regs:
+            try:
+                from xpra.codecs.gpujpeg import decoder as gj_decoder
+                for res in cuda_regs.values():
+                    gj_decoder.cuda_resource_unregister(res)
+            except Exception:
+                log("cuda surface unregister failed", exc_info=True)
         regs = self.vdpau_registrations
         self.vdpau_registrations = {}
         if not regs:
@@ -2044,8 +2121,7 @@ class GLWindowBackingBase(WindowBackingBase):
         try:
             nv_handle = glVDPAURegisterVideoSurfaceNV(
                 ctypes.c_void_p(vdp_surface), GL_TEXTURE_RECTANGLE, 4, arr)
-            from OpenGL.GL import GL_READ_ONLY as GL_RO
-            glVDPAUSurfaceAccessNV(nv_handle, GL_RO)
+            glVDPAUSurfaceAccessNV(nv_handle, GL_READ_ONLY)
         except GLError:
             glDeleteTextures(textures)
             raise
@@ -2074,16 +2150,28 @@ class GLWindowBackingBase(WindowBackingBase):
             if decoder is None or img.freed:
                 raise RuntimeError(f"stale zero-copy frame: {img!r}")
             self.vdpau_interop_init(decoder, gpu["device"], gpu["get_proc_address"])
-            nv_handle, textures = self.vdpau_register(gpu["surface"])
-            harr = (ctypes.c_ssize_t * 1)(nv_handle)
-            glVDPAUMapSurfacesNV(1, harr)
-            try:
-                shader = "NV12_FIELDS_to_RGB"
-                if img.get_full_range():
-                    shader += "_FULL"
-                self.render_vdpau_fields(textures, x, y, enc_width, enc_height, width, height, shader)
-            finally:
-                glVDPAUUnmapSurfacesNV(1, harr)
+            if width != enc_width or height != enc_height:
+                # scaled frames render through the CUDA kernels, which
+                # read the surface via their own CUDA registration -
+                # the GL alias textures are never sampled, so skip the
+                # GL register/map entirely (CUDA ordering comes from
+                # cudaGraphicsMapResources + the buffer unmap, not the
+                # GL map; vdpau_interop_init above still runs: it owns
+                # the decoder pinning + the same-device-new-decoder
+                # registration-cache flush)
+                self.render_vdpau_fields_scaled(x, y, enc_width, enc_height, width, height,
+                                                img.get_full_range(), surface=gpu["surface"])
+            else:
+                nv_handle, textures = self.vdpau_register(gpu["surface"])
+                harr = (ctypes.c_ssize_t * 1)(nv_handle)
+                glVDPAUMapSurfacesNV(1, harr)
+                try:
+                    shader = "NV12_FIELDS_to_RGB"
+                    if img.get_full_range():
+                        shader += "_FULL"
+                    self.render_vdpau_fields(textures, x, y, enc_width, enc_height, width, height, shader)
+                finally:
+                    glVDPAUUnmapSurfacesNV(1, harr)
             # if the decoder is closing and this was its last in-flight
             # frame, let go of its device NOW (GL context is current):
             # unregister + FiniNV first, then drop the reference - the
@@ -2113,9 +2201,197 @@ class GLWindowBackingBase(WindowBackingBase):
         img.free()
         fire_paint_callbacks(callbacks, False, message)
 
+    def free_cuda_scale_buffers(self) -> None:
+        # the strip GL buffer + its CUDA registration and TBO; called
+        # on return to 1:1 and at device release - the GL deletes stay
+        # inside the try so a dead context at close cannot abort the
+        # caller's teardown
+        buf = self.cuda_strip_buf
+        self.cuda_strip_buf = None
+        self.cuda_strip_words = 0
+        tex = self.cuda_strip_tex
+        self.cuda_strip_tex = 0
+        if not buf and not tex:
+            return
+        try:
+            if buf:
+                from xpra.codecs.gpujpeg import decoder as gj_decoder
+                gj_decoder.cuda_resource_unregister(buf[1])
+                glDeleteBuffers(1, [buf[0]])
+            if tex:
+                glDeleteTextures([tex])
+        except Exception:
+            log("cuda scale buffer free failed", exc_info=True)
+
+    def ensure_cuda_scale_buffers(self, gj_decoder, pitch_words: int, strip_rows: int) -> None:
+        # the H-strip buffer the P1+H kernel writes and the lanczos-v
+        # shader reads: pitch_words x strip_rows uint32 texels.
+        # GROW-ONLY: a larger need reallocates (register/unregister -
+        # rare), a smaller one reuses the allocation (geometry churn
+        # costs nothing).  WriteDiscard: fully rewritten every band.
+        need = pitch_words * strip_rows
+        if self.cuda_strip_buf and self.cuda_strip_words >= need:
+            return
+        self.free_cuda_scale_buffers()
+        # the strip is fetched as a texture buffer: the GL 3.3 spec
+        # minimum for GL_MAX_TEXTURE_BUFFER_SIZE is only 65536 texels
+        # (nvidia-340 reports 128M) - fail loudly rather than let
+        # texelFetch clamp silently on a min-spec implementation
+        max_texels = int(glGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE))
+        if need > max_texels:
+            raise RuntimeError(f"strip needs {need} texels > GL_MAX_TEXTURE_BUFFER_SIZE {max_texels}")
+        buf = int(glGenBuffers(1))
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, buf)
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, need * 4, None, GL_STREAM_DRAW)
+        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0)
+        try:
+            buf_res = gj_decoder.cuda_gl_buffer_register(buf)
+        except Exception:
+            glDeleteBuffers(1, [buf])
+            raise
+        self.cuda_strip_buf = (buf, buf_res)
+        self.cuda_strip_words = need
+        self.cuda_strip_tex = int(glGenTextures(1))
+        log("cuda scaled paint: strip buffer %i words (%ix%i)", need, pitch_words, strip_rows)
+
+    def render_vdpau_fields_scaled(self, rx: int, ry: int, rw: int, rh: int,
+                                   width: int, height: int, full_range: bool,
+                                   surface: int) -> None:
+        # scaled paint = ONE CUDA kernel + ONE GL shader per band.  The
+        # P1+H kernel (fs/share/xpra/cuda/xpra_vdpau_scale.cu, loaded
+        # by xpra.codecs.cuda_vdpau through pycuda inside the
+        # VDPAU-bound primary context) converts the band's source rows
+        # (field weave, chroma upsample, BT.601, sRGB EOTF, sigmoid) and
+        # applies the HORIZONTAL Lanczos taps - H only shares data
+        # along a row, so it fuses with the conversion at zero
+        # structural cost - writing an out_w-wide 10:10:10 H-strip into
+        # the CUDA-registered GL buffer (unmap = the sync point).  The
+        # lanczos-v shader then applies the 6 VERTICAL taps +
+        # anti-ringing + inverse sigmoid + sRGB OETF, fetching the
+        # strip as a texture buffer and rendering straight into the
+        # offscreen FBO at the band's window region.  The vertical taps
+        # share data ACROSS rows - on this GPU that sharing needs a
+        # materialization boundary, and the GL raster pass (mandatory
+        # anyway: only GL writes tiled textures on sm_11) provides it
+        # for free.
+        # The decoded surface registers with the process CUDA context -
+        # possible because cuda_vdpau bound it to the bridge's shared
+        # VdpDevice before any context existed, which libva decoder
+        # creation REQUIRES (a surface here implies a bound context).
+        # Errors propagate: paint_vdpau fails the frame and resets the
+        # interop session, the server repaints.
+        program = self.programs.get("lanczos-v")
+        if not program:
+            raise RuntimeError("no lanczos-v shader program")
+        from xpra.codecs.gpujpeg import decoder as gj_decoder
+        from xpra.codecs import cuda_vdpau
+        band_out = min(SCALE_BAND_ROWS, height)
+        # strip capacity for the largest band: its source-row footprint
+        # ceil(band*rh/height) + the 6-tap halo (+2 above, +3 below,
+        # plus one floor-slack row each side folded into the +6); the
+        # whole-video bound is rh+6, NOT rh+5 - on any upscale the top
+        # edge has floor(sy0) = -1, so a full-height band's unclamped
+        # footprint reaches video rows -3..rh+2
+        # rows padded to 16 words: sm_11's strict half-warp coalescing
+        # wants 64B-aligned row starts for the kernel's packed stores
+        pitch_words = (width + 15) & ~15
+        cap_rows = min(rh + 6, (band_out * rh + height - 1) // height + 6)
+        self.ensure_cuda_scale_buffers(gj_decoder, pitch_words, cap_rows)
+        # the registration above (or the surface map below) is a cudart
+        # call on this thread, so the primary context is current -
+        # ensure_scale_module's Context.attach() adopts it
+        cuda_vdpau.ensure_scale_module()
+        res = self.cuda_surface_resources.get(surface)
+        if res is None:
+            res = gj_decoder.cuda_vdpau_surface_register(surface)
+            self.cuda_surface_resources[surface] = res
+        buf, buf_res = self.cuda_strip_buf
+        if first_time(f"cuda-scale-{self.wid}"):
+            log.info("CUDA scaled paint active: %ix%i -> %ix%i", rw, rh, width, height)
+        w, h = self.size
+        self.draw_to_offscreen()
+        # loop invariants hoisted: program, the fixed uniforms and the
+        # fullscreen quad are the same for every band - only the
+        # viewport, the strip contents and strip_y0/strip_rows change.
+        # The SURFACE map + texref binds also hoist per paint: the
+        # surface is CUDA-read-only on the scaled path and the mapped
+        # array handles stay valid for the whole map; only the strip
+        # BUFFER needs per-band map/unmap (map = the GL->CUDA fence
+        # protecting band N-1's draw, unmap = CUDA->GL visibility).
+        glUseProgram(program)
+        glActiveTexture(GL_TEXTURE0)
+        glUniform1i(glGetUniformLocation(program, "strip"), 0)
+        glUniform2f(glGetUniformLocation(program, "viewport_pos"), rx, ry)
+        glUniform1f(glGetUniformLocation(program, "inv_scale_y"), rh / height)
+        glUniform1f(glGetUniformLocation(program, "vid_h"), rh)
+        glUniform1i(glGetUniformLocation(program, "pitch_words"), pitch_words)
+        loc_y0 = glGetUniformLocation(program, "strip_y0")
+        loc_rows = glGetUniformLocation(program, "strip_rows")
+        # the surface map stays OUTSIDE the try: unmap must only ever
+        # run on a successfully-mapped surface (the primitive cleans up
+        # its own partial failures); the quad VBO allocates INSIDE so a
+        # map failure cannot leak it
+        pos_buffer = 0
+        arrays = gj_decoder.cuda_scale_map_surface(res)
+        try:
+            pos_buffer = self.set_vao(0)
+            cuda_vdpau.bind_surface(*arrays)
+            band_y0 = 0
+            while band_y0 < height:
+                band_rows = min(band_out, height - band_y0)
+                # the band's source-row footprint: first tap of its
+                # first output row .. last tap of its last, UNCLAMPED
+                # (kernel 1 replicates edge rows, keeping the strip
+                # index an affine rebase); integer math - THE single
+                # copy of this formula
+                src_y0 = ((2 * band_y0 + 1) * rh - height) // (2 * height) - 2
+                src_y1 = ((2 * (band_y0 + band_rows) - 1) * rh - height) // (2 * height) + 3
+                strip_rows = src_y1 - src_y0 + 1
+                buf_ptr, buf_size = gj_decoder.cuda_scale_map_buffer(buf_res)
+                try:
+                    cuda_vdpau.scale_band(buf_ptr, buf_size, rw, rh, width,
+                                          src_y0, strip_rows, pitch_words,
+                                          full_range)
+                finally:
+                    gj_decoder.cuda_scale_unmap_buffer(buf_res)
+                # the band viewport only CLIPS (gl_FragCoord is
+                # viewport-independent), so viewport_pos stays FIXED at
+                # the window region's origin - rebasing it per band
+                # would perturb tap rounding
+                glViewport(min(w, max(0, rx)),
+                           min(h, max(0, h - ry - (band_y0 + band_rows))),
+                           min(w, max(0, width)),
+                           min(h, max(0, band_rows)))
+                # attach per band: WriteDiscard registration may remap
+                # the buffer's storage across map/unmap cycles
+                glBindTexture(GL_TEXTURE_BUFFER, self.cuda_strip_tex)
+                glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, buf)
+                glUniform1f(loc_y0, src_y0)
+                glUniform1i(loc_rows, strip_rows)
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+                glTexBuffer(GL_TEXTURE_BUFFER, GL_R32UI, 0)
+                glBindTexture(GL_TEXTURE_BUFFER, 0)
+                band_y0 += band_rows
+        finally:
+            # the unmap can itself raise (step-tagged) - the GL
+            # cleanup must still run so a failed paint leaves no
+            # program/VAO bound and no VBO behind
+            try:
+                gj_decoder.cuda_scale_unmap_surface(res)
+            finally:
+                if pos_buffer:
+                    glDeleteBuffers(1, [pos_buffer])
+                glBindVertexArray(0)
+                glUseProgram(0)
+
     def render_vdpau_fields(self, textures: tuple[int, ...],
                             rx: int, ry: int, rw: int, rh: int, width: int, height: int,
                             shader="NV12_FIELDS_to_RGB") -> None:
+        # 1:1 only - paint_vdpau routes scaled frames to the CUDA path.
+        # Back at 1:1, the H-strip buffer + its texture-buffer object
+        # are dead weight until the next scaled paint - release them
+        if self.cuda_strip_buf is not None:
+            self.free_cuda_scale_buffers()
         # modeled on render_planar_update, but sampling the 4 interop
         # field textures (uniforms Y0,C0,Y1,C1)
         target = GL_TEXTURE_RECTANGLE

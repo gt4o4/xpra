@@ -452,6 +452,16 @@ class WindowBackingBase:
 
     def assign_cuda_context(self, opengl=False) -> "cuda_device_context":
         if self.cuda_context is None:
+            # context-creating CUDA door: the VDPAU bind (see
+            # xpra.codecs.cuda_vdpau) must get its chance BEFORE the
+            # first context exists in the process; the module is only
+            # built where libva + gpujpeg are - absent, nvdec/nvjpeg
+            # simply run unbound
+            try:
+                from xpra.codecs.cuda_vdpau import ensure_vdpau_bind  # pylint: disable=import-outside-toplevel
+                ensure_vdpau_bind()
+            except ImportError:
+                pass
             from xpra.codecs.nvidia.cuda.context import (
                 get_default_device_context,  # @NoMove pylint: disable=no-name-in-module, import-outside-toplevel
                 cuda_device_context,

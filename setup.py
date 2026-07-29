@@ -530,6 +530,11 @@ nvdec_ENABLED           = False
 nvfbc_ENABLED           = nvidia_ENABLED and not ARM and pkg_config_exists("nvfbc")
 cuda_kernels_ENABLED    = nvidia_ENABLED and (nvenc_ENABLED or nvjpeg_encoder_ENABLED)
 cuda_rebuild_ENABLED    = None if (nvidia_ENABLED and not WIN32) else False
+# the scaled-VDPAU-paint kernel: a single-arch sm_11 cubin for
+# pre-Fermi clients, so it cannot join the fatbin kernels above
+# (their nvcc dropped sm_1x codegen at CUDA 7) - opt-in for build
+# hosts that carry a CUDA 6.5 nvcc (see the block near CUDA_BIN)
+vdpau_scale_cubin_ENABLED = False
 csc_libyuv_ENABLED      = DEFAULT and pkg_config_exists("libyuv")
 gstreamer_ENABLED       = DEFAULT
 example_ENABLED         = DEFAULT
@@ -577,7 +582,7 @@ DECODER_SWITCHES = [
     "jpeg_decoder", "gpujpeg_decoder", "avif_decoder", "jph_decoder",
 ]
 CODEC_SWITCHES = ENCODER_SWITCHES + DECODER_SWITCHES + [
-    "cuda_kernels", "cuda_rebuild",
+    "cuda_kernels", "cuda_rebuild", "vdpau_scale_cubin",
     "nvidia", "nvfbc",
     "openh264",
     "vpx", "webp",
@@ -2324,6 +2329,8 @@ def clean() -> None:
     ] + glob("build/etc/xpra/conf.d/*.conf")
     if cuda_rebuild_ENABLED:
         CLEAN_FILES += glob("fs/share/xpra/cuda/*.fatbin")
+    if vdpau_scale_cubin_ENABLED:
+        CLEAN_FILES += glob("fs/share/xpra/cuda/*.cubin")
     CLEAN_DIRS = []
     for path, dirs, filenames in os.walk("xpra"):
         for dirname in dirs:
@@ -3583,6 +3590,29 @@ if cuda_kernels_ENABLED:
             add_data_files("", glob(f"{CUDA_BIN_DIR}/nvjpeg64*dll"))
 if cuda_kernels_ENABLED or is_DEB():
     add_data_files(CUDA_BIN, ["fs/share/xpra/cuda/README.md"])
+if vdpau_scale_cubin_ENABLED:
+    # the scaled-VDPAU-paint kernel, compiled to a single-arch sm_11
+    # CUBIN (not a fatbin: exactly one target exists, and the loader -
+    # xpra/codecs/cuda_vdpau.pyx - AOT-loads it via the driver API; the
+    # 340-era driver's PTX JIT is not trusted).  The modern nvcc that
+    # builds the fatbin kernels above cannot target sm_1x, so the build
+    # host supplies a CUDA 6.5 nvcc (XPRA_NVCC, default "nvcc" from
+    # PATH) and its gcc<=4.8 host compiler (XPRA_NVCC_CCBIN) - nvcc 6.5
+    # rejects newer host compilers outright.
+    cu_src = "fs/share/xpra/cuda/xpra_vdpau_scale.cu"
+    cubin = "fs/share/xpra/cuda/xpra_vdpau_scale.cubin"
+    reason = should_rebuild(cu_src, cubin)
+    if reason:
+        print(f"* rebuilding xpra_vdpau_scale: {reason}")
+        cmd = [os.environ.get("XPRA_NVCC", "nvcc"), "-arch=sm_11", "-cubin", "-o", cubin, cu_src]
+        ccbin = os.environ.get("XPRA_NVCC_CCBIN", "")
+        if ccbin:
+            cmd += ["-ccbin", ccbin]
+        r = subprocess.Popen(cmd).wait()
+        if r != 0:
+            print(f"failed to build {cubin}: {cmd} returned {r}")
+            sys.exit(1)
+    add_data_files(CUDA_BIN, [cubin])
 
 cuda = "cuda"
 if nvjpeg_encoder_ENABLED or nvjpeg_decoder_ENABLED or nvdec_ENABLED:
@@ -3702,6 +3732,12 @@ if libva_encoder_ENABLED:
 if libva_decoder_ENABLED:
     ace("xpra.codecs.libva.decoder,xpra/codecs/libva/va_decode.c",
         "libva,libva-win32" if WIN32 else "libva,libva-drm,libva-x11,x11")
+# the CUDA<->VDPAU stack bootstrap: the device bind (a bootstrap
+# VADisplay via libva + X11, cudaVDPAUSetVDPAUDevice via libgpujpeg's
+# cudart) AND the scaled-paint kernel loader (pycuda, lazy) - see the
+# module docstring for why the bind half must be compiled
+tace(libva_decoder_ENABLED and gpujpeg_decoder_ENABLED and not WIN32,
+     "xpra.codecs.cuda_vdpau", "libgpujpeg,libva,libva-x11,x11")
 toggle_packages(gstreamer_ENABLED, "xpra.gstreamer")
 toggle_packages(remote_encoder_ENABLED, "xpra.codecs.remote")
 

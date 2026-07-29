@@ -44,6 +44,23 @@ _SIG_SCALE = 1.0 / (1.0 + math.exp(_SIG_SLOPE * (_SIG_CENTER - 1.0))) - _SIG_OFF
 _SIG_INV_SLOPE = 1.0 / _SIG_SLOPE
 _SIG_INV_SCALE = 1.0 / _SIG_SCALE
 _SIG_OFF_SCALE = _SIG_OFFSET / _SIG_SCALE
+# Lanczos3 kernel: plain (unstretched) - the paint path only ever
+# upscales in steady state (the server scales video DOWN to fit); a
+# transient window-shrink before the decoder restarts may briefly
+# downscale, mildly aliased for those frames - accepted.
+_LANCZOS_FN = """
+float lz(float x)
+{
+    x = abs(x);
+    if (x >= 3.0)
+        return 0.0;
+    if (x < 1e-5)
+        return 1.0;
+    float px = 3.14159265358979 * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+"""
+
 
 
 CS_MULTIPLIERS: dict[str, tuple[float, float, float, float, float]] = {
@@ -160,10 +177,13 @@ def gen_NV12_FIELDS_to_RGB(cs="bt601", full_range=True) -> str:
     row parity (interop2, which can expose whole frames, does not
     exist on legacy drivers).
 
-    At 1:1 (the normal case) sample positions are exactly integral,
-    so each fragment is one luma fetch and one co-sited chroma
-    fetch; non-integral draws nearest-sample through the same
-    fetches."""
+    This shader serves the UNSCALED (1:1) paint only: sample
+    positions are exactly integral, so each fragment is one luma
+    fetch and one co-sited chroma fetch.  Scaled paints run as ONE
+    CUDA kernel (fs/share/xpra/cuda/xpra_vdpau_scale.cu, loaded via
+    xpra.codecs.cuda_vdpau: conversion + horizontal Lanczos into the
+    H-strip) finished by the lanczos-v shader (the vertical taps +
+    display epilogue)."""
     if cs not in CS_MULTIPLIERS:
         raise ValueError(f"unsupported colorspace {cs}")
     a, b, c, d, e = CS_MULTIPLIERS[cs]
@@ -487,6 +507,88 @@ void main()
 }}
 """
 
+# The vertical half of the scaled VDPAU paint.  The CUDA side
+# (xpra_p1h_kernel in fs/share/xpra/cuda/xpra_vdpau_scale.cu, loaded
+# by xpra.codecs.cuda_vdpau) converts and HORIZONTALLY
+# filters each band's source rows into the H-strip - out_w-wide
+# 10:10:10-in-uint32 rows in a texture buffer, one row per CLAMPED
+# video row starting at strip_y0 (edge rows replicated), rows pitched
+# to pitch_words.  This shader finishes the separable Lanczos3: 6
+# vertical taps (weights on UNCLAMPED taps, rows clamped to the video
+# edge), anti-ringing 0.8 against the two bracketing rows, inverse
+# sigmoid, sRGB OETF.  The strip values are already row-normalized
+# and clamped to [0,1] (the 10-bit pack IS the between-passes clamp
+# the anti-ringing depends on).
+# gl_FragCoord is ABSOLUTE (origin_upper_left ignores the viewport),
+# so per-band viewports merely CLIP which fragments run -
+# viewport_pos stays fixed and every weight is bit-identical to an
+# unbanded render; bands cannot seam.  The row index is defensively
+# clamped to the strip (a formula divergence becomes a duplicated
+# ~zero-weight edge tap, never an undefined fetch).
+LANCZOS_V_SHADER = f"""
+#version {GLSL_VERSION}
+layout(origin_upper_left) in vec4 gl_FragCoord;
+uniform vec2 viewport_pos;
+uniform float inv_scale_y;
+uniform float vid_h;
+uniform float strip_y0;
+uniform int strip_rows;
+uniform int pitch_words;
+uniform usamplerBuffer strip;
+const float SIG_CENTER    = {_SIG_CENTER};
+const float SIG_SLOPE     = {_SIG_SLOPE};
+const float SIG_INV_SCALE = {_SIG_INV_SCALE};
+const float SIG_OFF_SCALE = {_SIG_OFF_SCALE};
+layout(location = 0) out vec4 frag_color;
+{_LANCZOS_FN}
+vec3 sig_inverse(vec3 c)
+{{
+    return SIG_INV_SCALE / (1.0 + exp(SIG_SLOPE * (SIG_CENTER - c))) - SIG_OFF_SCALE;
+}}
+
+vec3 srgb_oetf(vec3 c)
+{{
+    c = clamp(c, 0.0, 1.0);
+    vec3 lin = 12.92 * c;
+    vec3 curved = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+    return mix(curved, lin, lessThanEqual(c, vec3(0.0031308)));
+}}
+
+vec3 fetch10(int idx)
+{{
+    uint t = texelFetch(strip, idx).r;
+    return vec3(float((t >> 20) & 1023u), float((t >> 10) & 1023u), float(t & 1023u)) * (1.0 / 1023.0);
+}}
+
+void main()
+{{
+    vec2 pos = gl_FragCoord.xy - viewport_pos.xy;
+    int ox = int(pos.x);
+    float sy = pos.y * inv_scale_y - 0.5;
+    float by = floor(sy);
+    vec3 acc = vec3(0.0);
+    float wysum = 0.0;
+    vec3 n0 = vec3(0.0);
+    vec3 n1 = vec3(0.0);
+    for (int j = -2; j <= 3; j++) {{
+        float t = by + float(j);
+        float wy = lz(sy - t);
+        float ty = clamp(t, 0.0, vid_h - 1.0);
+        int sr = clamp(int(ty - strip_y0), 0, strip_rows - 1);
+        vec3 row = fetch10(sr * pitch_words + ox);
+        if (j == 0) n0 = row;
+        if (j == 1) n1 = row;
+        acc += wy * row;
+        wysum += wy;
+    }}
+    vec3 val = acc / wysum;
+    vec3 lo = min(n0, n1);
+    vec3 hi = max(n0, n1);
+    val = mix(val, clamp(val, lo, hi), 0.8);
+    frag_color = vec4(srgb_oetf(sig_inverse(val)), 1.0);
+}}
+"""
+
 SOURCE: dict[str, str] = {
     "blend": BLEND_SHADER,
     "vertex": VERTEX_SHADER,
@@ -494,6 +596,7 @@ SOURCE: dict[str, str] = {
     "fixed-color": FIXED_COLOR_SHADER,
     "upscale": UPSCALE_SHADER,
     "bgrx-buffer": BGRX_BUFFER_SHADER,
+    "lanczos-v": LANCZOS_V_SHADER,
 }
 
 for full in (False, True):
