@@ -35,7 +35,6 @@ per-image host buffer: the CPU never touches entropy decoding, IDCT
 or color conversion.
 """
 
-import os
 from time import monotonic
 from typing import Any
 from collections.abc import Sequence
@@ -76,6 +75,15 @@ cdef extern from *:
     static int xpra_cudaStreamCreate(void **pStream) {
         return (int) cudaStreamCreate((cudaStream_t *) pStream);
     }
+    extern cudaError_t cudaGraphicsVDPAURegisterVideoSurface(xpra_cudaGraphicsResource_t *resource,
+                                                             unsigned int vdpSurface,
+                                                             unsigned int flags);
+    /* header-declared with cudaArray_t* - shim the void** pun (gcc >= 14
+       makes incompatible pointer types a hard error) */
+    static int xpra_cudaGetSubArray(void **array, xpra_cudaGraphicsResource_t res,
+                                    unsigned int idx) {
+        return (int) cudaGraphicsSubResourceGetMappedArray((cudaArray_t *) array, res, idx, 0);
+    }
     """
     ctypedef void *xpra_cudaGraphicsResource_t
     int cudaGraphicsGLRegisterBuffer(xpra_cudaGraphicsResource_t *resource,
@@ -88,8 +96,12 @@ cdef extern from *:
                                    void *stream) nogil
     int cudaGraphicsUnregisterResource(xpra_cudaGraphicsResource_t resource) nogil
     int xpra_cudaStreamCreate(void **pStream) nogil
+    int cudaGraphicsVDPAURegisterVideoSurface(xpra_cudaGraphicsResource_t *resource,
+                                              unsigned int vdpSurface, unsigned int flags) nogil
+    int xpra_cudaGetSubArray(void **array, xpra_cudaGraphicsResource_t res, unsigned int idx) nogil
 
 cdef enum:
+    cudaGraphicsRegisterFlagsReadOnly = 1
     cudaGraphicsRegisterFlagsWriteDiscard = 2
 
 cdef extern from "libgpujpeg/gpujpeg_type.h":
@@ -180,6 +192,139 @@ def cleanup_module() -> None:
     log("gpujpeg.cleanup_module() frames=%i", g_frames)
 
 
+def cuda_vdpau_surface_register(surface: int) -> int:
+    """register a VdpVideoSurface (of the BOUND VdpDevice) for CUDA
+    access; returns an opaque resource handle for cuda_scale_map_surface /
+    cuda_resource_unregister.  Registration aliases - re-decodes into
+    the surface are visible on the next map."""
+    ensure_bootstrap()
+    cdef unsigned int surf = <unsigned int> surface
+    cdef xpra_cudaGraphicsResource_t res = NULL
+    cdef int r
+    with nogil:
+        r = cudaGraphicsVDPAURegisterVideoSurface(&res, surf, cudaGraphicsRegisterFlagsReadOnly)
+    if r:
+        raise RuntimeError(f"cudaGraphicsVDPAURegisterVideoSurface({surface}) failed: {r}")
+    log("cuda_vdpau_surface_register(%u)=%#x", surface, <size_t> res)
+    return <size_t> res
+
+
+def cuda_gl_buffer_register(glbuf: int) -> int:
+    """persistently register a GL buffer for CUDA writes (the H-strip buffer
+    is fully overwritten each fill, hence WriteDiscard)"""
+    ensure_bootstrap()
+    cdef unsigned int b = <unsigned int> glbuf
+    cdef xpra_cudaGraphicsResource_t res = NULL
+    cdef int r
+    with nogil:
+        r = cudaGraphicsGLRegisterBuffer(&res, b, cudaGraphicsRegisterFlagsWriteDiscard)
+    if r:
+        raise RuntimeError(f"cudaGraphicsGLRegisterBuffer({glbuf}) failed: {r}")
+    log("cuda_gl_buffer_register(%u)=%#x", glbuf, <size_t> res)
+    return <size_t> res
+
+
+def cuda_resource_unregister(res: int) -> None:
+    cdef xpra_cudaGraphicsResource_t resource = <xpra_cudaGraphicsResource_t> <size_t> res
+    cdef int r
+    with nogil:
+        r = cudaGraphicsUnregisterResource(resource)
+    log("cuda_resource_unregister(%#x)=%i", res, r)
+
+
+def cuda_scale_map_surface(surf_res: int) -> tuple:
+    """map a registered VDPAU surface and return its 4 field arrays
+    (y0, y1, c0, c1) as opaque handles for the cuda_vdpau loader's
+    texref binding.  Handles are only valid until the unmap - the
+    caller maps once per PAINT (the surface is CUDA-read-only on the
+    scaled path, so no per-band fencing is needed on it).  Cleans up
+    internally on partial failure: a raised error means NOT mapped."""
+    cdef xpra_cudaGraphicsResource_t sres = <xpra_cudaGraphicsResource_t> <size_t> surf_res
+    cdef void *arrs[4]
+    cdef int r, r2
+    cdef unsigned int i
+    with nogil:
+        r = cudaGraphicsMapResources(1, &sres, NULL)
+    if r != 0:
+        raise RuntimeError(f"gpujpeg: surface map failed ({r})")
+    r2 = 0
+    with nogil:
+        for i in range(4):
+            if r2 == 0:
+                r2 = xpra_cudaGetSubArray(&arrs[i], sres, i)
+    if r2 != 0:
+        with nogil:
+            cudaGraphicsUnmapResources(1, &sres, NULL)
+        raise RuntimeError(f"gpujpeg: get field arrays failed ({r2})")
+    return (<size_t> arrs[0], <size_t> arrs[1], <size_t> arrs[2], <size_t> arrs[3])
+
+
+def cuda_scale_unmap_surface(surf_res: int) -> None:
+    cdef xpra_cudaGraphicsResource_t sres = <xpra_cudaGraphicsResource_t> <size_t> surf_res
+    cdef int r
+    with nogil:
+        r = cudaGraphicsUnmapResources(1, &sres, NULL)
+    if r != 0:
+        raise RuntimeError(f"gpujpeg: surface unmap failed ({r})")
+
+
+def cuda_scale_map_buffer(buf_res: int) -> tuple:
+    """map the registered strip GL buffer and return (device pointer,
+    size).  PER BAND, mandatory both ways: the map is the GL->CUDA
+    fence (band N's kernel must not overwrite rows GL still reads
+    from band N-1) and the unmap is the CUDA->GL visibility point.
+    The pointer is fresh per map - WriteDiscard registration may
+    relocate the storage."""
+    cdef xpra_cudaGraphicsResource_t bres = <xpra_cudaGraphicsResource_t> <size_t> buf_res
+    cdef void *out = NULL
+    cdef size_t out_size = 0
+    cdef int r, r2
+    with nogil:
+        r = cudaGraphicsMapResources(1, &bres, NULL)
+    if r != 0:
+        raise RuntimeError(f"gpujpeg: buffer map failed ({r})")
+    with nogil:
+        r2 = cudaGraphicsResourceGetMappedPointer(&out, &out_size, bres)
+    if r2 != 0 or out == NULL:
+        with nogil:
+            cudaGraphicsUnmapResources(1, &bres, NULL)
+        raise RuntimeError(f"gpujpeg: buffer mapped pointer failed ({r2})")
+    return (<size_t> out, out_size)
+
+
+def cuda_scale_unmap_buffer(buf_res: int) -> None:
+    """the CUDA->GL sync point: GL commands issued after this see the
+    band's strip rows"""
+    cdef xpra_cudaGraphicsResource_t bres = <xpra_cudaGraphicsResource_t> <size_t> buf_res
+    cdef int r
+    with nogil:
+        r = cudaGraphicsUnmapResources(1, &bres, NULL)
+    if r != 0:
+        raise RuntimeError(f"gpujpeg: buffer unmap failed ({r})")
+
+
+
+cdef int g_bootstrapped = 0
+
+cdef void ensure_bootstrap() noexcept:
+    # give the VDPAU bind its one chance to run BEFORE this module's
+    # first context-creating CUDA call - every such entry point calls
+    # this: decoder create (get_decoder/get_alpha_decoder) and the
+    # GL-buffer and VDPAU-surface registrations.  Idempotent; failure
+    # is benign here (logged by the
+    # bind module) because libva decoder creation independently
+    # REQUIRES the bind - an unbound process never decodes h264
+    global g_bootstrapped
+    if g_bootstrapped:
+        return
+    g_bootstrapped = 1
+    try:
+        from xpra.codecs.cuda_vdpau import ensure_vdpau_bind
+        ensure_vdpau_bind()
+    except Exception:
+        log("cuda_vdpau bootstrap failed", exc_info=True)
+
+
 cdef void *make_stream() noexcept:
     # each decoder gets its own (blocking) CUDA stream so two decodes
     # can overlap on the GPU; NULL (the legacy default stream) is the
@@ -197,6 +342,7 @@ cdef gpujpeg_decoder *get_decoder() except NULL:
     global g_decoder
     if g_decoder != NULL:
         return g_decoder
+    ensure_bootstrap()
     if cudaSetDevice(0) != 0:
         raise RuntimeError("gpujpeg: cudaSetDevice failed")
     cdef gpujpeg_decoder *dec = gpujpeg_decoder_create(make_stream())
@@ -221,6 +367,7 @@ cdef gpujpeg_decoder *get_alpha_decoder() except NULL:
     global g_alpha_decoder
     if g_alpha_decoder != NULL:
         return g_alpha_decoder
+    ensure_bootstrap()
     if cudaSetDevice(0) != 0:
         raise RuntimeError("gpujpeg: cudaSetDevice failed")
     cdef gpujpeg_decoder *dec = gpujpeg_decoder_create(make_stream())
@@ -379,7 +526,10 @@ cdef tuple decode_gl(img_data, size_t aoff, unsigned int glbuf,
                 raise RuntimeError(f"gpujpeg: alpha plane is {info.width}x{info.height},"
                                    f" expected {width}x{height}")
             need = rgb_size + <size_t> width * <size_t> height
-        # the decoders (and their streams) must exist before any decode:
+        # the decoders (and their streams) must exist BEFORE the first
+        # cudaGraphics call: get_decoder runs the ensure_bootstrap
+        # gate, and the VDPAU bind inside it only works while NO
+        # context exists yet
         dec = get_decoder()
         if aoff:
             adec = get_alpha_decoder()
